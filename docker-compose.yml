@@ -1,0 +1,71 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spring-agent-studio-web
+    ports:
+      - "5173:5173"
+      # The backend shares this network namespace. Expose it only to the host
+      # so the local node client can use the same API as the browser.
+      - "127.0.0.1:8083:8080"
+    environment:
+      VITE_DEV_PROXY_TARGET: http://127.0.0.1:8080
+    volumes:
+      - .:/app
+      - web_node_modules:/app/node_modules
+    command:
+      - sh
+      - -c
+      - |
+        lock_hash=$$(sha256sum package-lock.json | awk '{print $$1}')
+        if [ ! -x node_modules/.bin/vite ] || [ "$$(cat node_modules/.package-lock.sha256 2>/dev/null)" != "$$lock_hash" ]; then
+          npm ci
+          printf '%s' "$$lock_hash" > node_modules/.package-lock.sha256
+        fi
+        exec npm run dev -- --host 0.0.0.0 --port 5173
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../spring-agent-studio-backend
+      dockerfile: Dockerfile.dev
+    container_name: spring-agent-studio-backend
+    environment:
+      SERVER_ADDRESS: 127.0.0.1
+      PORT: 8080
+      APP_SECURITY_MODE: LOCAL
+      APP_DATA_DIR: /workspace/data
+      SEARXNG_ENDPOINT: http://searxng:8080
+      EDGEFN_API_KEY: ${EDGEFN_API_KEY:-}
+      GRADLE_USER_HOME: /home/gradle/.gradle
+    volumes:
+      - ../spring-agent-studio-backend:/workspace
+      - backend_build:/workspace/build
+      - backend_project_gradle:/workspace/.gradle
+      - backend_gradle_cache:/home/gradle/.gradle
+    command: ["sh", "./gradlew", "bootRun", "--no-daemon"]
+    network_mode: service:web
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 90s
+    depends_on:
+      searxng:
+        condition: service_started
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: spring-agent-studio-searxng
+    volumes:
+      - ../spring-agent-studio-backend/infra/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    restart: unless-stopped
+
+volumes:
+  web_node_modules:
+  backend_build:
+  backend_project_gradle:
+  backend_gradle_cache:

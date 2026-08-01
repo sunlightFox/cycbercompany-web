@@ -1,5 +1,5 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
-import type { Agent, BatchIngestionResult, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeDocument, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunEvent, RunView, Skill, SkillRepository, Tool } from '../types'
+import type { Agent, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeDocument, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, Skill, SkillRepository, Tool } from '../types'
 
 const API_ROOT = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 
@@ -41,7 +41,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const response = await fetch(`${API_ROOT}${path}`, {
+    headers: {
+      Accept: 'application/octet-stream',
+      'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
+      'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
+      ...authenticationHeaders(),
+    },
+  })
+  if (!response.ok) {
+    const body = await response.text()
+    let detail = body
+    try {
+      const parsed = JSON.parse(body) as { detail?: string; message?: string }
+      detail = parsed.detail || parsed.message || body
+    } catch {}
+    throw new Error(detail || `Request failed with ${response.status}`)
+  }
+  return response.blob()
+}
+
 export const studioApi = {
+  getExecutionSettings: () => request<ExecutionSettings>('/execution-settings'),
+  updateExecutionSettings: (mode: ExecutionMode) => request<ExecutionSettings>('/execution-settings', { method: 'PATCH', body: JSON.stringify({ mode }) }),
   listAgents: () => request<Agent[]>('/agents'),
   listModels: () => request<ModelProfile[]>('/models'),
   listModelPresets: () => request<ModelPreset[]>('/models/presets'),
@@ -56,11 +79,19 @@ export const studioApi = {
   searchSkillRepositories: (payload: { query?: string; limit?: number }) => request<SkillRepository[]>('/skill-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
   discoverRepositorySkills: (payload: { repoUrl: string; ref?: string; limit?: number }) => request<RepositorySkill[]>('/skill-repositories/discover', { method: 'POST', body: JSON.stringify(payload) }),
   installSkill: (payload: { repoUrl: string; ref?: string; path?: string; id?: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills/install', { method: 'POST', body: JSON.stringify(payload) }),
+  searchClawHubSkills: (payload: { query?: string; limit?: number }) => {
+    const params = new URLSearchParams()
+    if (payload.query?.trim()) params.set('query', payload.query.trim())
+    if (payload.limit) params.set('limit', String(payload.limit))
+    const suffix = params.size ? `?${params}` : ''
+    return request<ClawHubSkill[]>(`/skill-registries/clawhub/search${suffix}`)
+  },
+  installClawHubSkill: (payload: { reference: string; id?: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills/install/clawhub', { method: 'POST', body: JSON.stringify(payload) }),
   setSkillEnabled: (id: string, enabled: boolean) => request<Skill>(`/skills/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   deleteSkill: (id: string) => request<void>(`/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   listMcpConnections: () => request<McpConnection[]>('/mcp-connections'),
   listMcpRepositories: () => request<McpRepository[]>('/mcp-repositories'),
-  searchMcpRepositories: (payload: { query?: string; limit?: number }) => request<McpRepository[]>('/mcp-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
+  searchMcpRepositories: (payload: { query?: string; limit?: number; source?: 'registry' | 'github' }) => request<McpRepository[]>('/mcp-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
   installNpmMcp: (payload: { id?: string; name: string; description?: string; npmPackage: string; packageArgs?: string[]; env?: Record<string, string>; enabled?: boolean; refreshTools?: boolean }) => request<McpConnection>('/mcp-connections/install-npm', { method: 'POST', body: JSON.stringify(payload) }),
   createMcpConnection: (payload: { name: string; description?: string; transportType: 'STDIO' | 'STREAMABLE_HTTP' | 'SSE'; command?: string; args?: string[]; endpoint?: string; env?: Record<string, string>; enabled?: boolean }) => request<McpConnection>('/mcp-connections', { method: 'POST', body: JSON.stringify(payload) }),
   updateMcpConnection: (id: string, payload: { name?: string; description?: string; transportType?: 'STDIO' | 'STREAMABLE_HTTP' | 'SSE'; command?: string; args?: string[]; endpoint?: string; env?: Record<string, string>; enabled?: boolean }) => request<McpConnection>(`/mcp-connections/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -104,6 +135,9 @@ export const studioApi = {
     files.forEach((file) => body.append('files', file))
     return request<ConversationAttachment[]>(`/conversations/${encodeURIComponent(conversationId)}/attachments`, { method: 'POST', body })
   },
+  listConversationAttachments: (conversationId: string) => request<ConversationAttachment[]>(`/conversations/${encodeURIComponent(conversationId)}/attachments`),
+  downloadConversationAttachment: (conversationId: string, attachmentId: string) => requestBlob(`/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}/download`),
+  deleteConversationAttachment: (conversationId: string, attachmentId: string) => request<void>(`/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' }),
   createRun: (payload: {
     conversationId: string
     text: string
@@ -120,8 +154,12 @@ export const studioApi = {
     body: JSON.stringify(payload),
   }),
   cancelRun: (id: string) => request<void>(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  retryRun: (id: string) => request<CreateRunResponse>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
   getRun: (id: string) => request<RunView>(`/runs/${encodeURIComponent(id)}`),
+  getRunAudit: (id: string) => request<RunAudit>(`/runs/${encodeURIComponent(id)}/audit`),
   getConversationQueue: (id: string) => request<ConversationQueue>(`/conversations/${encodeURIComponent(id)}/queue`),
+  listRunArtifacts: (id: string) => request<Artifact[]>(`/runs/${encodeURIComponent(id)}/artifacts`),
+  downloadArtifact: (id: string) => requestBlob(`/artifacts/${encodeURIComponent(id)}`),
   getCodingEvidence: (id: string) => request<CodingRunEvidence>(`/runs/${encodeURIComponent(id)}/coding-evidence`),
   getCodingQuality: (id: string) => request<CodingRunQuality>(`/runs/${encodeURIComponent(id)}/coding-quality`),
 }
@@ -168,7 +206,7 @@ export async function streamRunEvents(
         try {
           const parsed = JSON.parse(event.data) as RunEvent
           onEvent(parsed)
-          if (['FINAL_ANSWER', 'RUN_FAILED', 'RUN_CANCELLED'].includes(parsed.type)) terminal = true
+          if (['FINAL_ANSWER', 'RUN_FAILED', 'RUN_CANCELLED', 'RUN_INTERRUPTED'].includes(parsed.type)) terminal = true
         } catch {
           // Ignore keep-alive frames and malformed non-domain frames.
         }

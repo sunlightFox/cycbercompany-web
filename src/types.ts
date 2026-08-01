@@ -41,6 +41,13 @@ export type ModelSettings = {
   defaultModelProfileId: string
 }
 
+export type ExecutionMode = 'PERSONAL_LOCAL' | 'LOCAL_AND_NODES' | 'NODES_ONLY'
+
+export type ExecutionSettings = {
+  mode: ExecutionMode
+  updatedAt?: string | null
+}
+
 export type ModelTestResult = {
   modelProfileId: string
   success: boolean
@@ -89,6 +96,18 @@ export type RepositorySkill = {
   ref: string
   path: string
   installId: string
+}
+
+export type ClawHubSkill = {
+  id: string
+  name: string
+  description: string
+  reference: string
+  url: string
+  downloads: number
+  official: boolean
+  suspicious: boolean
+  verdict: string
 }
 
 export type McpConnection = {
@@ -141,6 +160,10 @@ export type McpRepository = {
   defaultBranch: string
   stars: number
   sourceType: string
+  installType?: 'NPM' | 'REMOTE' | 'REPOSITORY'
+  npmPackage?: string | null
+  transportType?: 'STDIO' | 'STREAMABLE_HTTP' | 'SSE' | null
+  endpoint?: string | null
 }
 
 export type KnowledgeBase = {
@@ -163,6 +186,10 @@ export type KnowledgeDocument = {
   chunkCount: number
   summary?: string
   rebuildable: boolean
+  indexStatus?: 'READY' | 'INDEXING' | 'FAILED' | string
+  indexError?: string | null
+  indexedAt?: string | null
+  indexDurationMs?: number | null
   createdAt?: string
   updatedAt?: string
 }
@@ -201,10 +228,12 @@ export type RebuildIndexResult = {
 export type NodeConnection = {
   id: string
   name: string
+  kind?: 'MANAGED_LOCAL' | 'REGISTERED'
   hostname?: string
   osName?: string
   osArch?: string
   clientVersion?: string
+  features?: string[]
   enabled: boolean
   status?: string
   lastSeenAt?: string
@@ -286,6 +315,18 @@ export type ConversationAttachment = {
   createdAt?: string
 }
 
+export type Artifact = {
+  id: string
+  runId?: string | null
+  artifactType: string
+  filename: string
+  mimeType: string
+  sizeBytes: number
+  digest: string
+  downloadUrl: string
+  createdAt?: string
+}
+
 export type CodingRunEvidence = {
   runId: string
   toolCalls: number
@@ -316,14 +357,52 @@ export type RunView = {
   conversationId: string
   modelProfileId: string
   agentId: string
+  retryOfRunId?: string | null
   skillSnapshotDigest?: string | null
-  status: 'QUEUED' | 'CREATED' | 'RUNNING' | 'WAITING_APPROVAL' | 'SUCCEEDED' | 'NEEDS_VERIFICATION' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT'
+  status: 'QUEUED' | 'CREATED' | 'RUNNING' | 'WAITING_APPROVAL' | 'SUCCEEDED' | 'NEEDS_VERIFICATION' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' | 'INTERRUPTED'
   finalAnswer?: string | null
   errorMessage?: string | null
   queuePosition?: number | null
   createdAt?: string
   startedAt?: string | null
   finishedAt?: string | null
+}
+
+export type RunAuditTimelineEntry = {
+  id: string
+  kind: 'event' | 'tool' | 'node-tool' | 'mcp' | 'approval' | 'artifact' | string
+  title: string
+  detail?: string | null
+  status: string
+  occurredAt: string
+  sequence?: number | null
+}
+
+export type RunAudit = {
+  run: RunView
+  snapshot?: {
+    agentId: string
+    agentPromptVersion: number
+    modelProfileId: string
+    modelName: string
+    allowedTools: string[]
+    knowledgeBaseIds: string[]
+    mcpConnectionIds: string[]
+    nodeId?: string | null
+    workingDirectory: string
+    skillIds: string[]
+    createdAt: string
+  } | null
+  summary: {
+    events: number
+    tools: number
+    nodeTools: number
+    mcpTools: number
+    approvals: number
+    artifacts: number
+  }
+  timeline: RunAuditTimelineEntry[]
+  artifacts: Artifact[]
 }
 
 export type ConversationQueue = {
@@ -335,7 +414,7 @@ export type ConversationQueue = {
 
 export type RunEvent = {
   sequence: number
-  type: 'RUN_QUEUED' | 'SKILLS_RESOLVED' | 'RUN_STARTED' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'RETRIEVAL_SOURCES' | 'MODEL_RATE_LIMITED' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_APPROVAL_REQUIRED' | 'TOOL_CALL_COMPLETED' | 'TOOL_BUDGET_WARNING' | 'RUN_WAITING_APPROVAL' | 'RUN_RESUMED' | 'TOOL_CALL_FAILED' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'RUN_NEEDS_VERIFICATION' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED'
+  type: 'RUN_QUEUED' | 'SKILLS_RESOLVED' | 'RUN_STARTED' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'RETRIEVAL_SOURCES' | 'MODEL_RATE_LIMITED' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_APPROVAL_REQUIRED' | 'TOOL_CALL_COMPLETED' | 'TOOL_BUDGET_WARNING' | 'RUN_WAITING_APPROVAL' | 'RUN_RESUMED' | 'TOOL_CALL_FAILED' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'RUN_NEEDS_VERIFICATION' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED' | 'RUN_INTERRUPTED'
   payload: string
   createdAt?: string
 }
@@ -347,7 +426,7 @@ export type CreateRunResponse = {
   eventsUrl: string
 }
 
-export type StepStatus = 'running' | 'waiting' | 'warning' | 'complete' | 'failed'
+export type StepStatus = 'running' | 'waiting' | 'warning' | 'complete' | 'failed' | 'cancelled'
 
 export type RunStep = {
   id: string

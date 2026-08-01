@@ -16,6 +16,7 @@ type StudioState = {
   backendAvailable: boolean
   setTheme: (theme: Theme) => void
   toggleSidebar: () => void
+  setSidebarOpen: (open: boolean) => void
   setSettingsOpen: (open: boolean) => void
   setSourceCitationId: (id: string | null) => void
   setSelectedAgentId: (id: string) => void
@@ -44,6 +45,7 @@ export const useStudioStore = create<StudioState>((set) => ({
     set({ theme })
   },
   toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
+  setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   setSourceCitationId: (sourceCitationId) => set({ sourceCitationId }),
   setSelectedAgentId: (selectedAgentId) => set({ selectedAgentId }),
