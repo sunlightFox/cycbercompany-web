@@ -6,6 +6,17 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   return {
     plugins: [react()],
+    build: {
+      rolldownOptions: {
+        output: {
+          manualChunks(moduleId) {
+            if (moduleId.includes('react-markdown') || moduleId.includes('remark-gfm')) return 'markdown'
+            if (moduleId.includes('@radix-ui/')) return 'radix'
+            return undefined
+          },
+        },
+      },
+    },
     server: {
       proxy: {
         '/api': {

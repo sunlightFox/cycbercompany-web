@@ -102,9 +102,35 @@ export type McpConnection = {
   args?: string[]
   endpoint?: string
   envKeys?: string[]
-  tools?: { name: string; description?: string; enabled?: boolean; requiresApproval?: boolean }[]
+  tools?: McpTool[]
   createdAt?: string
   updatedAt?: string
+}
+
+export type McpTool = {
+  id: string
+  name: string
+  description?: string
+  inputSchema?: string
+  riskLevel?: string
+  requiresApproval: boolean
+  enabled: boolean
+  discoveredAt?: string
+}
+
+export type McpToolInvocation = {
+  id: string
+  runId?: string | null
+  connectionId: string
+  toolName: string
+  status: string
+  argumentKeys?: string | null
+  argumentsSha256?: string | null
+  resultContentItems?: number | null
+  errorCategory?: string | null
+  createdAt?: string
+  startedAt?: string | null
+  finishedAt?: string | null
 }
 
 export type McpRepository = {
@@ -154,6 +180,17 @@ export type IngestionResult = {
   duplicate: boolean
 }
 
+export type BatchIngestionResult = {
+  files: Array<{
+    sourceName: string
+    documentId?: string | null
+    chunkCount: number
+    duplicate: boolean
+    error?: string | null
+    succeeded: boolean
+  }>
+}
+
 export type RebuildIndexResult = {
   knowledgeBaseId: string
   documentId?: string | null
@@ -200,6 +237,13 @@ export type NodeRegistrationToken = {
   usageHint: string
 }
 
+export type RotateNodeSecretResult = {
+  nodeId: string
+  nodeSecret: string
+  websocketUrl: string
+  rotatedAt: string
+}
+
 export type NodeToolApproval = {
   id: string
   nodeId: string
@@ -234,9 +278,64 @@ export type Conversation = {
   messages: Message[]
 }
 
+export type ConversationAttachment = {
+  id: string
+  fileName: string
+  contentType: string
+  byteSize: number
+  createdAt?: string
+}
+
+export type CodingRunEvidence = {
+  runId: string
+  toolCalls: number
+  changedFiles: string[]
+  verificationTools: string[]
+  commandVerifications: string[]
+  browserTraceArtifacts: string[]
+  browserVerified: boolean
+  failedTools: string[]
+}
+
+export type CodingRunQuality = {
+  runId: string
+  score: number
+  grade: string
+  checks: Array<{
+    name: string
+    earnedPoints: number
+    maximumPoints: number
+    passed: boolean
+    explanation: string
+  }>
+  recommendations: string[]
+}
+
+export type RunView = {
+  id: string
+  conversationId: string
+  modelProfileId: string
+  agentId: string
+  skillSnapshotDigest?: string | null
+  status: 'QUEUED' | 'CREATED' | 'RUNNING' | 'WAITING_APPROVAL' | 'SUCCEEDED' | 'NEEDS_VERIFICATION' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT'
+  finalAnswer?: string | null
+  errorMessage?: string | null
+  queuePosition?: number | null
+  createdAt?: string
+  startedAt?: string | null
+  finishedAt?: string | null
+}
+
+export type ConversationQueue = {
+  conversationId: string
+  activeRunId?: string | null
+  pending: Array<{ runId: string; position?: number }>
+  guide?: { message?: string; cancelHint?: string }
+}
+
 export type RunEvent = {
   sequence: number
-  type: 'RUN_STARTED' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_CALL_COMPLETED' | 'TOOL_CALL_FAILED' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED'
+  type: 'RUN_QUEUED' | 'SKILLS_RESOLVED' | 'RUN_STARTED' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'RETRIEVAL_SOURCES' | 'MODEL_RATE_LIMITED' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_APPROVAL_REQUIRED' | 'TOOL_CALL_COMPLETED' | 'TOOL_BUDGET_WARNING' | 'RUN_WAITING_APPROVAL' | 'RUN_RESUMED' | 'TOOL_CALL_FAILED' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'RUN_NEEDS_VERIFICATION' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED'
   payload: string
   createdAt?: string
 }
@@ -244,10 +343,11 @@ export type RunEvent = {
 export type CreateRunResponse = {
   runId: string
   status: string
+  queuePosition: number
   eventsUrl: string
 }
 
-export type StepStatus = 'running' | 'complete' | 'failed'
+export type StepStatus = 'running' | 'waiting' | 'warning' | 'complete' | 'failed'
 
 export type RunStep = {
   id: string
@@ -269,7 +369,14 @@ export type Citation = {
 export type StudioMessage = Message & {
   steps?: RunStep[]
   citations?: Citation[]
+  retryInput?: string
+  approvalId?: string
+  approvalDecision?: 'pending' | 'approved' | 'rejected' | 'error'
+  attachmentIds?: string[]
+  attachmentSummaries?: Array<{ name: string; kind: 'file' | 'image' }>
+  queuePosition?: number
   isStreaming?: boolean
+  runState?: 'queued' | 'running' | 'waitingApproval' | 'needsVerification' | 'completed' | 'failed' | 'cancelled'
   error?: string
   durationMs?: number
 }
