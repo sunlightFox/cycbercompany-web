@@ -46,6 +46,7 @@ import {
 } from "lucide-react";
 import {
   Children,
+  Fragment,
   lazy,
   Suspense,
   useCallback,
@@ -58,18 +59,24 @@ import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
-import { studioApi, streamRunEvents } from "./lib/api";
+import { RunLaunchTimeoutError, studioApi, streamRunEvents } from "./lib/api";
+import { createUuid } from "./lib/uuid";
 import { useStudioStore } from "./store/useStudioStore";
+import { AgentManager } from "./components/AgentManager";
 import type {
   Agent,
+  ApprovalMode,
   Artifact,
   Citation,
   ClawHubSkill,
   ExecutionMode,
-  ExecutionSettings,
   ConversationAttachment,
   KnowledgeBase,
+  KnowledgeChunk,
   KnowledgeDocument,
+  KnowledgeSearchResult,
+  KnowledgeSettings,
+  KnowledgeSettingsUpdate,
   McpConnection,
   McpRepository,
   McpTool,
@@ -82,8 +89,10 @@ import type {
   NodeConnection,
   RepositorySkill,
   RunEvent,
+  RunView,
   RunStep,
   Skill,
+  SkillPreflight,
   SkillRepository,
   StudioMessage,
   Tool,
@@ -115,6 +124,7 @@ type HistoryEntry = { id: string; title: string; updatedAt: string };
 
 const HISTORY_STORAGE_KEY = "studio-conversation-history";
 const CITATION_STORAGE_KEY = "studio-conversation-citations";
+const APPROVAL_MODE_STORAGE_KEY = "studio-conversation-approval-modes";
 const AssistantMarkdown = lazy(() => import("./components/AssistantMarkdown"));
 const NodeManager = lazy(() => import("./components/NodeManager"));
 const CitationDrawer = lazy(() => import("./components/CitationDrawer"));
@@ -193,6 +203,44 @@ function cachedCitations(conversationId: string, message: Message) {
   );
 }
 
+function readConversationApprovalMode(conversationId: string | null): ApprovalMode {
+  if (!conversationId) return "on-request";
+  try {
+    const stored = JSON.parse(
+      localStorage.getItem(APPROVAL_MODE_STORAGE_KEY) ?? "{}",
+    ) as Record<string, unknown>;
+    const mode = stored[conversationId];
+    return mode === "full-access" || mode === "auto-approve"
+      ? mode
+      : "on-request";
+  } catch {
+    return "on-request";
+  }
+}
+
+function writeConversationApprovalMode(
+  conversationId: string,
+  mode: ApprovalMode,
+) {
+  try {
+    const stored = JSON.parse(
+      localStorage.getItem(APPROVAL_MODE_STORAGE_KEY) ?? "{}",
+    ) as Record<string, ApprovalMode>;
+    stored[conversationId] = mode;
+    localStorage.setItem(APPROVAL_MODE_STORAGE_KEY, JSON.stringify(stored));
+  } catch {
+    localStorage.setItem(
+      APPROVAL_MODE_STORAGE_KEY,
+      JSON.stringify({ [conversationId]: mode }),
+    );
+  }
+}
+
+function isNetworkFailure(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  return /failed to fetch|networkerror|network request failed/i.test(error.message);
+}
+
 function citationsUsedInAnswer(content: string, citations: Citation[]) {
   const citationOrdinals = new Map<Citation["type"], number>();
   return citations.filter((citation) => {
@@ -201,6 +249,54 @@ function citationsUsedInAnswer(content: string, citations: Citation[]) {
     const prefix = citation.type === "knowledge" ? "K" : citation.type === "web" ? "W" : "M";
     return new RegExp(`\\[${prefix}${ordinal}(?::[^\\]]+)?\\]`).test(content);
   });
+}
+
+const TERMINAL_RUN_STATUSES = new Set([
+  "SUCCEEDED",
+  "NEEDS_VERIFICATION",
+  "FAILED",
+  "CANCELLED",
+  "TIMED_OUT",
+  "INTERRUPTED",
+]);
+
+function messageFromRun(message: StudioMessage, run: RunView, translate: (key: string) => string): StudioMessage {
+  const terminal = TERMINAL_RUN_STATUSES.has(run.status);
+  const delivery: StudioMessage["delivery"] = run.deliveryGate?.status === "VERIFIED"
+    ? "verified"
+    : run.status === "SUCCEEDED"
+      ? "unavailable"
+      : run.deliveryGate?.status === "UNAVAILABLE"
+        ? "unavailable"
+        : "needsVerification";
+  const base = {
+    ...message,
+    runId: run.id,
+    queuePosition: run.queuePosition ?? message.queuePosition,
+    delivery,
+    deliveryGate: run.deliveryGate ?? (run.status === "SUCCEEDED" ? null : { status: "UNAVAILABLE" }),
+    sync: terminal ? "recovered" as const : "reconnecting" as const,
+    lifecycle: terminal ? "terminal" as const : run.status === "WAITING_APPROVAL" ? "waitingApproval" as const : ["QUEUED", "CREATED"].includes(run.status) ? "queued" as const : "running" as const,
+  };
+  if (run.status === "SUCCEEDED") return { ...base, content: run.finalAnswer || message.content, isStreaming: false, runState: "completed", outcome: "succeeded", error: undefined };
+  if (run.status === "NEEDS_VERIFICATION") return { ...base, content: run.finalAnswer || message.content, isStreaming: false, runState: "needsVerification", outcome: "succeeded", error: run.errorMessage || translate("needsVerification") };
+  if (run.status === "FAILED") return { ...base, isStreaming: false, runState: "failed", outcome: "failed", error: run.errorMessage || translate("runFailed") };
+  if (run.status === "TIMED_OUT") return { ...base, isStreaming: false, runState: "timedOut", outcome: "failed", error: run.errorMessage || translate("runFailed") };
+  if (run.status === "INTERRUPTED") return { ...base, isStreaming: false, runState: "interrupted", outcome: "failed", error: run.errorMessage || translate("runFailed") };
+  if (run.status === "CANCELLED") return { ...base, isStreaming: false, runState: "cancelled", outcome: "cancelled", error: translate("runCancelled") };
+  if (run.status === "WAITING_APPROVAL") return { ...base, isStreaming: true, runState: "waitingApproval", outcome: "unknown" };
+  if (["QUEUED", "CREATED"].includes(run.status)) return { ...base, isStreaming: true, runState: "queued", outcome: "unknown" };
+  return { ...base, isStreaming: true, runState: "running", outcome: "unknown" };
+}
+
+function withPendingApproval(
+  message: StudioMessage,
+  pendingApprovalByRun: Map<string, string>,
+): StudioMessage {
+  const approvalId = message.runId ? pendingApprovalByRun.get(message.runId) : undefined;
+  return approvalId
+    ? { ...message, approvalId, approvalDecision: "pending" }
+    : message;
 }
 
 function IconButton({
@@ -365,7 +461,7 @@ function App() {
     (state) => state.setBackendAvailable,
   );
   const [prompt, setPrompt] = useState("");
-  const [managedRunIds, setManagedRunIds] = useState<string[]>([]);
+  const [, setManagedRunIds] = useState<string[]>([]);
   const [stoppingRunIds, setStoppingRunIds] = useState<string[]>([]);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [expandedMessageId, setExpandedMessageId] = useState<
@@ -379,8 +475,13 @@ function App() {
     mcpServerIds: [],
     toolNames: [],
   });
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(() =>
+    readConversationApprovalMode(conversationId),
+  );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const [skillPreflight, setSkillPreflight] = useState<SkillPreflight | null>(null);
+  const [isPreflighting, setIsPreflighting] = useState(false);
   const [historyEntries, setHistoryEntries] =
     useState<HistoryEntry[]>(readHistory);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -394,6 +495,12 @@ function App() {
   const [isNearConversationBottom, setIsNearConversationBottom] = useState(true);
   const abortControllersRef = useRef(new Map<string, AbortController>());
   const stopRequestedRunIdsRef = useRef(new Set<string>());
+  const runInputRef = useRef(new Map<string, string>());
+  const conversationInputRef = useRef(new Map<string, string>());
+  const ensureConversationRef = useRef<Promise<string> | null>(null);
+  const restoredConversationRef = useRef<string | null>(null);
+  const conversationLoadRef = useRef(0);
+  const initialConversationRef = useRef(conversationId);
   const runSessionRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const configurationTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -438,12 +545,12 @@ function App() {
 
   const updateAssistant = useCallback(
     (runId: string, updater: (message: StudioMessage) => StudioMessage) => {
-      setMessages(
-        useStudioStore
-          .getState()
-          .messages.map((message) =>
-            message.runId === runId ? updater(message) : message,
-          ),
+      setMessages((messages) =>
+        messages.map((message) =>
+            message.role === "ASSISTANT" && message.runId === runId
+              ? updater(message)
+              : message,
+        ),
       );
     },
     [setMessages],
@@ -454,6 +561,11 @@ function App() {
     );
   }, []);
   const replaceTrackedRun = useCallback((previousRunId: string, runId: string) => {
+    const input = runInputRef.current.get(previousRunId);
+    if (input !== undefined) {
+      runInputRef.current.delete(previousRunId);
+      runInputRef.current.set(runId, input);
+    }
     setManagedRunIds((current) =>
       current.map((item) => (item === previousRunId ? runId : item)),
     );
@@ -464,9 +576,10 @@ function App() {
     setManagedRunIds((current) => current.filter((item) => item !== runId));
     setStoppingRunIds((current) => current.filter((item) => item !== runId));
     setRecoveryRunIds((current) => current.filter((item) => item !== runId));
-  }, []);
-  const isRunning = managedRunIds.length > 0;
-
+    setComposerNotice((current) =>
+      current === t("stoppingRun") ? null : current,
+    );
+  }, [t]);
   const agentsQuery = useQuery({
     queryKey: ["agents"],
     queryFn: studioApi.listAgents,
@@ -505,71 +618,30 @@ function App() {
     const refreshRun = async (runId: string) => {
       try {
         const run = await studioApi.getRun(runId);
+        const pendingApprovalByRun = new Map<string, string>();
+        if (run.status === "WAITING_APPROVAL") {
+          const [nodeApprovals, toolApprovals] = await Promise.all([
+            studioApi.listNodeToolApprovals().catch(() => []),
+            studioApi.listToolApprovals().catch(() => []),
+          ]);
+          [...nodeApprovals, ...toolApprovals]
+            .filter((approval) => approval.runId === run.id && (approval.status === "PENDING" || approval.status === "REQUESTED"))
+            .sort((left, right) => String(right.requestedAt ?? right.createdAt ?? "").localeCompare(String(left.requestedAt ?? left.createdAt ?? "")))
+            .forEach((approval) => {
+              if (approval.runId && !pendingApprovalByRun.has(approval.runId)) {
+                pendingApprovalByRun.set(approval.runId, approval.id);
+              }
+            });
+        }
         if (disposed) return;
-        const terminal = ["SUCCEEDED", "NEEDS_VERIFICATION", "FAILED", "CANCELLED", "TIMED_OUT", "INTERRUPTED"].includes(run.status);
         updateAssistant(run.id, (message) => {
-          const completedSteps = (message.steps ?? []).map((step) =>
-            step.status === "failed"
-              ? step
-              : { ...step, status: "complete" as const, duration: step.duration ?? t("stepDone") },
-          );
-          if (run.status === "SUCCEEDED")
-            return {
-              ...message,
-              content: run.finalAnswer || message.content,
-              steps: completedSteps,
-              isStreaming: false,
-              runState: "completed",
-              error: undefined,
-              durationMs: elapsedSince(message.createdAt),
-            };
-          if (run.status === "FAILED" || run.status === "TIMED_OUT" || run.status === "INTERRUPTED")
-            return {
-              ...message,
-              steps: completedSteps.map((step) => ({
-                ...step,
-                status: "failed" as const,
-                duration: t("stepFailed"),
-              })),
-              isStreaming: false,
-              runState: "failed",
-              error: run.errorMessage || t("runFailed"),
-              durationMs: elapsedSince(message.createdAt),
-            };
-          if (run.status === "CANCELLED")
-            return {
-              ...message,
-              steps: completedSteps,
-              isStreaming: false,
-              runState: "cancelled",
-              error: t("runCancelled"),
-              durationMs: elapsedSince(message.createdAt),
-            };
-          if (run.status === "WAITING_APPROVAL")
-            return {
-              ...message,
-              isStreaming: true,
-              runState: "waitingApproval",
-            };
-          if (run.status === "NEEDS_VERIFICATION")
-            return {
-              ...message,
-              content: run.finalAnswer || message.content,
-              isStreaming: false,
-              runState: "needsVerification",
-              error: run.errorMessage || t("needsVerification"),
-              durationMs: elapsedSince(message.createdAt),
-            };
-          if (run.status === "QUEUED" || run.status === "CREATED")
-            return {
-              ...message,
-              isStreaming: true,
-              queuePosition: run.queuePosition ?? message.queuePosition,
-              runState: "queued",
-            };
-          return { ...message, isStreaming: true, runState: "running" };
+          const next = messageFromRun(message, run, t);
+          const restored = withPendingApproval(next, pendingApprovalByRun);
+          return TERMINAL_RUN_STATUSES.has(run.status)
+            ? { ...next, steps: (message.steps ?? []).map((step) => step.status === "failed" ? step : { ...step, status: run.status === "FAILED" || run.status === "TIMED_OUT" || run.status === "INTERRUPTED" ? "failed" as const : "complete" as const, duration: step.duration ?? t(run.status === "FAILED" || run.status === "TIMED_OUT" || run.status === "INTERRUPTED" ? "stepFailed" : "stepDone") }), durationMs: elapsedSince(message.createdAt) }
+            : restored;
         });
-        if (terminal) {
+        if (TERMINAL_RUN_STATUSES.has(run.status)) {
           finishRun(run.id);
           setComposerNotice(null);
         }
@@ -604,11 +676,42 @@ function App() {
     queryKey: ["conversation-queue", conversationId],
     queryFn: () => studioApi.getConversationQueue(conversationId ?? ""),
     enabled: Boolean(conversationId) && backendAvailable,
-    refetchInterval: managedRunIds.some((runId) => !runId.startsWith("pending-"))
-      ? 1_500
-      : false,
+    refetchInterval: conversationId && backendAvailable ? 1_500 : false,
   });
-  const activeConversationRunId = conversationQueueQuery.data?.activeRunId ?? null;
+  const queuedActiveRunId = conversationQueueQuery.data?.activeRunId ?? null;
+  const activeConversationRunId = queuedActiveRunId && messages.some(
+    (message) => message.runId === queuedActiveRunId && message.lifecycle !== "terminal" && message.isStreaming,
+  ) ? queuedActiveRunId : null;
+
+  // A cancel request can race with the SSE stream: the terminal RUN_CANCELLED
+  // event may arrive before the HTTP cancel response or before the stream
+  // reader finishes. Once the message is terminal, clear the local stop
+  // bookkeeping so the composer cannot remain stuck on "stopping".
+  useEffect(() => {
+    const finishedStopIds = stoppingRunIds.filter((runId) =>
+      messages.some((message) => message.runId === runId && message.lifecycle === "terminal"),
+    );
+    finishedStopIds.forEach((runId) => finishRun(runId));
+  }, [finishRun, messages, stoppingRunIds]);
+
+  useEffect(() => {
+    if (!stoppingRunIds.length || activeConversationRunId) return;
+    const hasCancelledMessage = messages.some(
+      (message) => message.lifecycle === "terminal" && message.outcome === "cancelled",
+    );
+    if (!hasCancelledMessage) return;
+    stoppingRunIds.forEach((runId) => {
+      abortControllersRef.current.delete(runId);
+      stopRequestedRunIdsRef.current.delete(runId);
+      setRecoveryRunIds((current) => current.filter((item) => item !== runId));
+    });
+    setManagedRunIds((current) =>
+      current.filter((runId) => !stoppingRunIds.includes(runId)),
+    );
+    setStoppingRunIds([]);
+    setComposerNotice((current) => (current === t("stoppingRun") ? null : current));
+  }, [activeConversationRunId, messages, stoppingRunIds, t]);
+
   const conversationAttachmentsQuery = useQuery({
     queryKey: ["conversation-attachments", conversationId],
     queryFn: () => studioApi.listConversationAttachments(conversationId ?? ""),
@@ -629,15 +732,67 @@ function App() {
   useEffect(() => {
     const queue = conversationQueueQuery.data;
     if (!queue) return;
-    for (const entry of queue.pending) {
-      updateAssistant(entry.runId, (message) => ({
-        ...message,
-        isStreaming: true,
-        queuePosition: entry.position ?? message.queuePosition,
-        runState: "queued",
-      }));
-    }
-  }, [conversationQueueQuery.data, updateAssistant]);
+    let disposed = false;
+    const entries = [
+      ...(queue.activeRunId ? [{ runId: queue.activeRunId, position: 1 }] : []),
+      ...queue.pending,
+    ];
+    void (async () => {
+      const [nodeApprovals, toolApprovals] = await Promise.all([
+        studioApi.listNodeToolApprovals().catch(() => []),
+        studioApi.listToolApprovals().catch(() => []),
+      ]);
+      if (disposed) return;
+      const pendingApprovalByRun = new Map<string, string>();
+      [...nodeApprovals, ...toolApprovals]
+        .filter((approval) => approval.runId && (approval.status === "PENDING" || approval.status === "REQUESTED"))
+        .forEach((approval) => {
+          if (approval.runId && !pendingApprovalByRun.has(approval.runId))
+            pendingApprovalByRun.set(approval.runId, approval.id);
+        });
+      const missingRunIds = entries
+        .filter((entry) => !useStudioStore.getState().messages.some((message) => message.runId === entry.runId))
+        .map((entry) => entry.runId);
+      const persistedUsersByRun = new Map<string, StudioMessage>();
+      if (missingRunIds.length && conversationId) {
+        const conversation = await studioApi.getConversation(conversationId).catch(() => null);
+        if (disposed || !conversation) return;
+        const missing = new Set(missingRunIds);
+        conversation.messages
+          .filter((message) => message.role === "USER" && message.runId && missing.has(message.runId))
+          .forEach((message) => persistedUsersByRun.set(message.runId!, message as StudioMessage));
+      }
+      for (const entry of entries) {
+        trackRun(entry.runId);
+        setRecoveryRunIds((current) => current.includes(entry.runId) ? current : [...current, entry.runId]);
+        setMessages((currentMessages) => {
+          if (currentMessages.some((message) => message.runId === entry.runId))
+            return currentMessages;
+          // The launch response has not yet associated this optimistic assistant with
+          // the server run. Keep that pair intact instead of creating a duplicate
+          // recovered pair that can hide the user's original message.
+          if (
+            currentMessages.some(
+              (message) =>
+                message.role === "ASSISTANT" &&
+                message.runId?.startsWith("pending-"),
+            )
+          )
+            return currentMessages;
+          const persistedUser = persistedUsersByRun.get(entry.runId);
+          return [
+            ...currentMessages,
+            ...(persistedUser ? [persistedUser] : []),
+            withPendingApproval({ id: `assistant-recovered-${entry.runId}`, role: "ASSISTANT", content: "", runId: entry.runId, retryInput: runInputRef.current.get(entry.runId) ?? persistedUser?.content, steps: [], isStreaming: true, runState: pendingApprovalByRun.has(entry.runId) ? "waitingApproval" : "queued", lifecycle: "running", outcome: "unknown", delivery: "unavailable", sync: "recovered", createdAt: new Date().toISOString() }, pendingApprovalByRun),
+          ];
+        });
+        updateAssistant(entry.runId, (message) => message.lifecycle === "terminal" ? message : withPendingApproval({ ...message, retryInput: message.retryInput ?? runInputRef.current.get(entry.runId), isStreaming: true, queuePosition: entry.position ?? message.queuePosition, runState: pendingApprovalByRun.has(entry.runId) ? "waitingApproval" : entry.runId === queue.activeRunId ? "running" : "queued", lifecycle: "running", sync: "recovered" }, pendingApprovalByRun));
+      }
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, [conversationId, conversationQueueQuery.data, setMessages, trackRun, updateAssistant]);
   const toolsQuery = useQuery({
     queryKey: ["tools"],
     queryFn: studioApi.listTools,
@@ -666,8 +821,16 @@ function App() {
     queryKey: ["nodes"],
     queryFn: studioApi.listNodes,
     retry: 1,
-    enabled: backendAvailable && exposesNodes,
+    enabled: backendAvailable,
   });
+  const localExecutorNodeId = executionMode === "PERSONAL_LOCAL"
+    ? nodesQuery.data?.find(
+      (node) =>
+        node.kind === "MANAGED_LOCAL" &&
+        node.enabled &&
+        node.status?.toUpperCase() === "ONLINE",
+    )?.id
+    : undefined;
   const selectedCitation = messages
     .flatMap((message) => message.citations ?? [])
     .find((citation) => citation.id === sourceCitationId);
@@ -686,6 +849,12 @@ function App() {
   const auditQuery = useQuery({
     queryKey: ["run-audit", auditRunId],
     queryFn: () => studioApi.getRunAudit(auditRunId ?? ""),
+    enabled: Boolean(auditRunId) && backendAvailable,
+    retry: 1,
+  });
+  const auditWorkflowQuery = useQuery({
+    queryKey: ["run-workflow", auditRunId],
+    queryFn: () => studioApi.getRunWorkflow(auditRunId ?? ""),
     enabled: Boolean(auditRunId) && backendAvailable,
     retry: 1,
   });
@@ -770,19 +939,11 @@ function App() {
   );
 
   const resetTask = useCallback(() => {
-    runSessionRef.current += 1;
-    for (const runId of managedRunIds) {
-      if (!runId.startsWith("pending-")) void studioApi.cancelRun(runId).catch(() => undefined);
-    }
-    abortControllersRef.current.forEach((controller) => controller.abort());
-    abortControllersRef.current.clear();
-    stopRequestedRunIdsRef.current.clear();
-    setManagedRunIds([]);
-    setStoppingRunIds([]);
-    setRecoveryRunIds([]);
+    conversationLoadRef.current += 1;
     setConversationId(null);
     setMessages([]);
     setPrompt("");
+    setApprovalMode("on-request");
     clearAttachments();
     setCapabilityState({
       knowledgeBaseIds: [],
@@ -796,7 +957,6 @@ function App() {
     window.setTimeout(() => textareaRef.current?.focus(), 0);
   }, [
     clearAttachments,
-    managedRunIds,
     setConversationId,
     setMessages,
     setSourceCitationId,
@@ -827,7 +987,7 @@ function App() {
         if (event.type === "SKILLS_RESOLVED")
           steps.push({
             id: `${runId}-skills-${event.sequence}`,
-            label: t("resolveCapabilities"),
+            kind: "capabilities", label: t("resolveCapabilities"),
             status: "complete",
             duration: t("stepDone"),
           });
@@ -835,7 +995,7 @@ function App() {
           const queuePosition = extractQueuePosition(event.payload);
           steps.push({
             id: `${runId}-queue-${event.sequence}`,
-            label: t("queued"),
+            kind: "queue", label: t("queued"),
             detail:
               queuePosition && queuePosition > 1
                 ? queuePositionLabel(t, queuePosition)
@@ -854,7 +1014,7 @@ function App() {
           steps.splice(0, steps.length, ...completePrevious());
           steps.push({
             id: `${runId}-start`,
-            label: t("startCoordinator"),
+            kind: "coordinator", label: t("startCoordinator"),
             status: "complete",
             duration: t("stepReady"),
           });
@@ -862,7 +1022,7 @@ function App() {
         if (event.type === "STEP_STARTED")
           steps.push({
             id: `${runId}-step-${event.sequence}`,
-            label: t("executeEmployee"),
+            kind: "execution", label: t("executeEmployee"),
             detail: event.payload,
             status: "running",
           });
@@ -870,7 +1030,7 @@ function App() {
           const next = completePrevious();
           next.push({
             id: `${runId}-retrieval-${event.sequence}`,
-            label: t("retrieveContext"),
+            kind: "retrieval", label: t("retrieveContext"),
             detail: event.payload,
             status: "complete",
           });
@@ -884,7 +1044,7 @@ function App() {
         if (event.type === "TOOL_CALL_REQUESTED")
           steps.push({
             id: `${runId}-tool-${event.sequence}`,
-            label: t("requestTool"),
+            kind: "tool-request", label: t("requestTool"),
             detail: event.payload,
             status: "running",
           });
@@ -893,13 +1053,13 @@ function App() {
             .reverse()
             .find(
               (step) =>
-                step.status === "running" && step.label === t("requestTool"),
+                step.status === "running" && step.kind === "tool-request",
             );
           if (active) active.label = t("runTool");
           else
             steps.push({
               id: `${runId}-tool-${event.sequence}`,
-              label: t("runTool"),
+              kind: "tool", label: t("runTool"),
               detail: event.payload,
               status: "running",
             });
@@ -913,8 +1073,7 @@ function App() {
             .find(
               (step) =>
                 step.status === "running" &&
-                (step.label === t("requestTool") ||
-                  step.label === t("runTool")),
+                (step.kind === "tool-request" || step.kind === "tool"),
             );
           if (active) {
             active.status =
@@ -925,7 +1084,7 @@ function App() {
           } else
             steps.push({
               id: `${runId}-tool-${event.sequence}`,
-              label: t("runTool"),
+              kind: "tool", label: t("runTool"),
               detail: event.payload,
               status: event.type === "TOOL_CALL_FAILED" ? "failed" : "complete",
               duration:
@@ -937,14 +1096,14 @@ function App() {
         if (event.type === "MODEL_RATE_LIMITED")
           steps.push({
             id: `${runId}-rate-limit-${event.sequence}`,
-            label: t("modelRateLimited"),
+            kind: "warning", label: t("modelRateLimited"),
             detail: event.payload,
             status: "warning",
           });
         if (event.type === "TOOL_BUDGET_WARNING")
           steps.push({
             id: `${runId}-tool-budget-${event.sequence}`,
-            label: t("toolBudgetWarning"),
+            kind: "warning", label: t("toolBudgetWarning"),
             detail: event.payload,
             status: "warning",
           });
@@ -961,7 +1120,7 @@ function App() {
           } else
             steps.push({
               id: `${runId}-approval-${event.sequence}`,
-              label: t("awaitingApproval"),
+              kind: "approval", label: t("awaitingApproval"),
               detail: event.payload,
               status: "waiting",
             });
@@ -977,7 +1136,7 @@ function App() {
         if (event.type === "RUN_RESUMED") {
           steps.splice(0, steps.length, ...completePrevious());
           steps.push({
-            id: `${runId}-resumed-${event.sequence}`,
+            id: `${runId}-resumed-${event.sequence}`, kind: "resume",
             label: t("runResumed"),
             detail: event.payload,
             status: "running",
@@ -986,7 +1145,7 @@ function App() {
         }
         if (event.type === "RUN_NEEDS_VERIFICATION") {
           steps.push({
-            id: `${runId}-verification-${event.sequence}`,
+            id: `${runId}-verification-${event.sequence}`, kind: "verification",
             label: t("needsVerification"),
             detail: event.payload,
             status: "warning",
@@ -1005,7 +1164,7 @@ function App() {
             ? steps
             : [
                 {
-                  id: `${runId}-answer`,
+                  id: `${runId}-answer`, kind: "answer",
                   label: t("organizeAnswer"),
                   status: "running" as const,
                 },
@@ -1013,11 +1172,11 @@ function App() {
           if (
             !next.some(
               (step) =>
-                step.label === t("organizeAnswer") && step.status === "running",
+                step.kind === "answer" && step.status === "running",
             )
           )
             next.push({
-              id: `${runId}-answer`,
+              id: `${runId}-answer`, kind: "answer",
               label: t("organizeAnswer"),
               status: "running",
             });
@@ -1043,6 +1202,10 @@ function App() {
             steps: completePrevious(),
             isStreaming: false,
             runState: needsVerification ? "needsVerification" : "completed",
+            lifecycle: "terminal",
+            outcome: "succeeded",
+            delivery: message.delivery ?? "unavailable",
+            sync: "live",
             error: needsVerification ? message.error || t("needsVerification") : undefined,
             durationMs: elapsedSince(message.createdAt),
           };
@@ -1053,6 +1216,9 @@ function App() {
             steps: completePrevious("failed"),
             isStreaming: false,
             runState: "failed",
+            lifecycle: "terminal",
+            outcome: "failed",
+            sync: "live",
             error: event.payload || t("runFailed"),
             durationMs: elapsedSince(message.createdAt),
           };
@@ -1062,6 +1228,9 @@ function App() {
             steps: completePrevious("cancelled"),
             isStreaming: false,
             runState: "cancelled",
+            lifecycle: "terminal",
+            outcome: "cancelled",
+            sync: "live",
             error: t("runCancelled"),
             durationMs: elapsedSince(message.createdAt),
           };
@@ -1070,7 +1239,10 @@ function App() {
             ...message,
             steps: completePrevious("failed"),
             isStreaming: false,
-            runState: "failed",
+            runState: "interrupted",
+            lifecycle: "terminal",
+            outcome: "failed",
+            sync: "live",
             error: event.payload || t("runFailed"),
             durationMs: elapsedSince(message.createdAt),
           };
@@ -1094,33 +1266,152 @@ function App() {
         rememberConversation(state.conversationId, title);
         return state.conversationId;
       }
-      const result = await studioApi.createConversation(title || t("newTask"));
-      setConversationId(result.id);
-      rememberConversation(result.id, title);
-      return result.id;
+      if (ensureConversationRef.current) return ensureConversationRef.current;
+      // Do not allow an older history restore to replace these optimistic messages.
+      conversationLoadRef.current += 1;
+      ensureConversationRef.current = studioApi.createConversation(title || t("newTask")).then((result) => {
+        // The composer already inserted the optimistic user and assistant messages.
+        // Suppress the automatic empty-history restoration for this brand-new conversation.
+        restoredConversationRef.current = result.id;
+        setConversationId(result.id);
+        writeConversationApprovalMode(result.id, approvalMode);
+        rememberConversation(result.id, title);
+        return result.id;
+      }).finally(() => {
+        ensureConversationRef.current = null;
+      });
+      return ensureConversationRef.current;
     },
-    [rememberConversation, setConversationId, t],
+    [approvalMode, rememberConversation, setConversationId, t],
   );
 
   const openConversation = useCallback(
-    async (id: string) => {
-      if (isRunning) {
-        setComposerNotice(t("taskRunningSwitchBlocked"));
-        setHistoryOpen(false);
-        setSearchOpen(false);
-        return;
-      }
+    async (id: string, preserveLiveMessages = false) => {
       if (openingConversationId) return;
+      const loadId = conversationLoadRef.current + 1;
+      conversationLoadRef.current = loadId;
       setOpeningConversationId(id);
       try {
         const conversation = await studioApi.getConversation(id);
         setConversationId(conversation.id);
-        setMessages(
-          conversation.messages.map((message) => ({
-            ...message,
-            citations: cachedCitations(conversation.id, message),
-          })),
+        setApprovalMode(readConversationApprovalMode(conversation.id));
+        let runs: RunView[] = [];
+        try {
+          runs = await studioApi.listConversationRuns(conversation.id);
+        } catch {
+          runs = (await Promise.all(conversation.messages.filter((message) => message.runId).map((message) => studioApi.getRun(message.runId!).catch(() => null)))).filter((run): run is RunView => Boolean(run));
+        }
+        const runById = new Map(runs.map((run) => [run.id, run]));
+        const [nodeApprovals, toolApprovals] = await Promise.all([
+          studioApi.listNodeToolApprovals().catch(() => []),
+          studioApi.listToolApprovals().catch(() => []),
+        ]);
+        const pendingApprovalByRun = new Map<string, string>();
+        [...nodeApprovals, ...toolApprovals]
+          .filter((approval) => approval.runId && (approval.status === "PENDING" || approval.status === "REQUESTED"))
+          .sort((left, right) => String(right.requestedAt ?? right.createdAt ?? "").localeCompare(String(left.requestedAt ?? left.createdAt ?? "")))
+          .forEach((approval) => {
+            if (approval.runId && !pendingApprovalByRun.has(approval.runId)) {
+              pendingApprovalByRun.set(approval.runId, approval.id);
+            }
+          });
+        const persistedAssistantRunIds = new Set(
+          conversation.messages
+            .filter((message) => message.role === "ASSISTANT" && message.runId)
+            .map((message) => message.runId as string),
         );
+        const restoredAssistantRunIds = new Set(persistedAssistantRunIds);
+        const restoredMessages: StudioMessage[] = [];
+        conversation.messages.forEach((message) => {
+          const restored = message.runId ? runById.get(message.runId) : undefined;
+          const mapped = { ...message, citations: cachedCitations(conversation.id, message) } as StudioMessage;
+          if (message.role === "ASSISTANT") {
+            if (message.runId) restoredAssistantRunIds.add(message.runId);
+            const restoredMessage = restored
+              ? messageFromRun(mapped, restored, t)
+              : message.runId
+                ? {
+                    ...mapped,
+                    runState: "unknown" as const,
+                    outcome: "unknown" as const,
+                    delivery: "unavailable" as const,
+                    sync: "lost" as const,
+                    error: t("streamDisconnected"),
+                  }
+                : mapped;
+            restoredMessages.push(withPendingApproval(restoredMessage, pendingApprovalByRun));
+            return;
+          }
+
+          restoredMessages.push(mapped);
+          if (!message.runId || persistedAssistantRunIds.has(message.runId)) return;
+          const run = runById.get(message.runId);
+          if (!run) return;
+          const syntheticAssistant: StudioMessage = {
+            id: `assistant-${run.id}`,
+            role: "ASSISTANT",
+            content: "",
+            runId: run.id,
+            retryInput: message.content,
+            steps: [],
+            isStreaming: true,
+            runState: "running",
+            lifecycle: "running",
+            outcome: "unknown",
+            delivery: "unavailable",
+            sync: "reconnecting",
+            createdAt: run.createdAt ?? message.createdAt,
+          };
+          restoredMessages.push(
+            withPendingApproval(
+              messageFromRun(syntheticAssistant, run, t),
+              pendingApprovalByRun,
+            ),
+          );
+          restoredAssistantRunIds.add(run.id);
+        });
+        // A retry reuses the original conversation input and intentionally does not append
+        // another user message. Restore its assistant placeholder from the run record so a
+        // refresh cannot leave the active retry invisible while the queue is still running.
+        runs.forEach((run) => {
+          if (restoredAssistantRunIds.has(run.id)) return;
+          const sourceUser = conversation.messages.find(
+            (message) => message.role === "USER" && message.runId === run.id,
+          );
+          const syntheticAssistant: StudioMessage = {
+            id: `assistant-${run.id}`,
+            role: "ASSISTANT",
+            content: "",
+            runId: run.id,
+            retryInput: sourceUser?.content,
+            steps: [],
+            isStreaming: !TERMINAL_RUN_STATUSES.has(run.status),
+            runState: "running",
+            lifecycle: "running",
+            outcome: "unknown",
+            delivery: "unavailable",
+            sync: "recovered",
+            createdAt: run.createdAt ?? new Date().toISOString(),
+          };
+          restoredMessages.push(
+            withPendingApproval(
+              messageFromRun(syntheticAssistant, run, t),
+              pendingApprovalByRun,
+            ),
+          );
+          restoredAssistantRunIds.add(run.id);
+        });
+        if (conversationLoadRef.current !== loadId) return;
+        const hasLiveMessages = useStudioStore
+          .getState()
+          .messages.some((message) => message.isStreaming && message.lifecycle !== "terminal");
+        if (preserveLiveMessages && hasLiveMessages) return;
+        setMessages(restoredMessages);
+        const activeRuns = runs.filter((run) => !TERMINAL_RUN_STATUSES.has(run.status));
+        activeRuns.forEach((run) => trackRun(run.id));
+        setRecoveryRunIds((current) => [
+          ...new Set([...current, ...activeRuns.map((run) => run.id)]),
+        ]);
         setHistoryOpen(false);
         setSearchOpen(false);
         setComposerNotice(null);
@@ -1133,11 +1424,42 @@ function App() {
         setOpeningConversationId(null);
       }
     },
-    [isRunning, openingConversationId, setConversationId, setMessages, t],
+    [openingConversationId, setConversationId, setMessages, t, trackRun],
   );
+
+  useEffect(() => {
+    const initialConversationId = initialConversationRef.current;
+    if (
+      !initialConversationId ||
+      !backendAvailable ||
+      conversationId !== initialConversationId ||
+      restoredConversationRef.current === initialConversationId
+    ) return;
+    initialConversationRef.current = null;
+    restoredConversationRef.current = initialConversationId;
+    void openConversation(initialConversationId, true);
+  }, [backendAvailable, conversationId, openConversation]);
+
+  const reconcileRunLaunch = useCallback(async (clientRequestId: string) => {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        const run = await studioApi.findRunByClientRequestId(clientRequestId);
+        if (run) return run;
+      } catch {
+        // Older servers may not expose this lookup yet. The message remains unknown and non-retryable.
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 750 * (attempt + 1)));
+    }
+    return null;
+  }, []);
 
   const handleSend = useCallback(
     async (overrideText?: string, retryAttachmentIds?: string[]) => {
+      if (isPreflighting) return;
+      if (!backendAvailable) {
+        setComposerNotice(t("backendOffline"));
+        return;
+      }
       const rawText = overrideText ?? prompt;
       const text = rawText.trim();
       const localAttachments = retryAttachmentIds ? [] : attachments;
@@ -1146,6 +1468,59 @@ function App() {
       const runInput = text || t("attachmentOnlyPrompt");
       const displayInput =
         text || t("attachmentOnlyPrompt");
+      let runNodeId = capabilityState.nodeId ?? localExecutorNodeId;
+      if (!runNodeId && executionMode === "PERSONAL_LOCAL") {
+        const latestNodes = await nodesQuery.refetch();
+        runNodeId = latestNodes.data?.find(
+          (node) =>
+            node.kind === "MANAGED_LOCAL" &&
+            node.enabled &&
+            node.status?.toUpperCase() === "ONLINE",
+        )?.id;
+      }
+      const hasSelectedCapabilities = Boolean(
+        capabilityState.knowledgeBaseIds.length ||
+        capabilityState.skillIds.length ||
+        capabilityState.mcpServerIds.length ||
+        capabilityState.toolNames.length ||
+        runNodeId,
+      );
+      const hasDefaultSkills = Boolean(currentAgent?.defaultSkillIds?.length);
+      if (hasSelectedCapabilities || hasDefaultSkills) {
+        setComposerNotice(null);
+        setIsPreflighting(true);
+        try {
+          const preflight = await studioApi.preflightSkill({
+            agentId: currentAgent?.id,
+            skillIds: capabilityState.skillIds,
+            toolNames: capabilityState.toolNames,
+            knowledgeBaseIds: capabilityState.knowledgeBaseIds,
+            mcpServerIds: capabilityState.mcpServerIds,
+            nodeId: runNodeId,
+          });
+          setSkillPreflight(preflight);
+          if (!preflight.ready) {
+            setComposerNotice(
+              preflight.compatibility.issues[0]?.message ?? t("skillPreflightFailed"),
+            );
+            return;
+          }
+        } catch (error) {
+          setSkillPreflight(null);
+          setComposerNotice(
+            isNetworkFailure(error)
+              ? t("backendOffline")
+              : error instanceof Error
+                ? error.message
+                : t("skillPreflightFailed"),
+          );
+          return;
+        } finally {
+          setIsPreflighting(false);
+        }
+      } else {
+        setSkillPreflight(null);
+      }
       setPrompt("");
       setComposerNotice(null);
       const sessionId = runSessionRef.current;
@@ -1160,6 +1535,8 @@ function App() {
         createdAt: new Date().toISOString(),
       };
       const runId = `pending-${Date.now()}`;
+      runInputRef.current.set(runId, displayInput);
+      const clientRequestId = createUuid();
       const assistantMessage: StudioMessage = {
         id: `assistant-${Date.now()}`,
         role: "ASSISTANT",
@@ -1169,13 +1546,13 @@ function App() {
         steps: [],
         isStreaming: true,
         runState: "queued",
+        lifecycle: "queued",
+        outcome: "unknown",
+        delivery: "unavailable",
+        sync: "live",
         createdAt: new Date().toISOString(),
       };
-      setMessages([
-        ...useStudioStore.getState().messages,
-        userMessage,
-        assistantMessage,
-      ]);
+      setMessages((messages) => [...messages, userMessage, assistantMessage]);
       trackRun(runId);
       let serverRunId: string | null = null;
       let shouldRecoverRun = false;
@@ -1184,6 +1561,7 @@ function App() {
         const conversation = await ensureConversation(
           (text || localAttachments[0]?.name || t("newTask")).slice(0, 64),
         );
+        conversationInputRef.current.set(conversation, displayInput);
         failureStage = "upload";
         const attachmentIds = retryAttachmentIds ?? (
           localAttachments.length
@@ -1213,17 +1591,19 @@ function App() {
           ...(capabilityState.toolNames.length
             ? { toolNames: capabilityState.toolNames }
             : {}),
-          ...(capabilityState.nodeId ? { nodeId: capabilityState.nodeId } : {}),
+          ...(runNodeId ? { nodeId: runNodeId } : {}),
+          approvalMode,
         };
         const run = await studioApi.createRun({
           conversationId: conversation,
           text: runInput,
           agentId: currentAgent?.id,
           modelProfileId:
-            defaultModelProfileId ?? currentAgent?.defaultModelProfileId,
+            currentAgent?.defaultModelProfileId ?? defaultModelProfileId,
           ...(attachmentIds.length ? { attachmentIds } : {}),
+          clientRequestId,
           ...selectedCapabilities,
-        });
+        }, { idempotencyKey: clientRequestId });
         serverRunId = run.runId;
         if (!retryAttachmentIds?.length)
           clearSentAttachments(localAttachments.map((attachment) => attachment.id));
@@ -1233,12 +1613,32 @@ function App() {
           return;
         }
         replaceTrackedRun(runId, run.runId);
+        setMessages((currentMessages) => {
+          const hasServerUser = currentMessages.some(
+            (message) => message.role === "USER" && message.runId === run.runId,
+          );
+          if (hasServerUser) return currentMessages;
+          const hasOptimisticUser = currentMessages.some(
+            (message) => message.id === userMessage.id,
+          );
+          return hasOptimisticUser
+            ? currentMessages.map((message) =>
+                message.id === userMessage.id ? { ...message, runId: run.runId } : message,
+              )
+            : [...currentMessages, { ...userMessage, runId: run.runId }];
+        });
+        updateAssistant(run.runId, (message) => ({
+          ...message,
+          retryInput: message.retryInput ?? runInputRef.current.get(run.runId),
+        }));
         updateAssistant(runId, (message) => ({
           ...message,
           runId: run.runId,
           attachmentIds,
           queuePosition: run.queuePosition,
           runState: "queued",
+          lifecycle: "queued",
+          sync: "live",
         }));
         const controller = new AbortController();
         abortControllersRef.current.set(run.runId, controller);
@@ -1247,11 +1647,31 @@ function App() {
           run.runId,
           (event) => handleRunEvent(run.runId, conversation, event),
           controller.signal,
+          { onStatus: (sync) => updateAssistant(run.runId, (message) => ({ ...message, sync })) },
         );
+        const persistedRun = await studioApi.getRun(run.runId).catch(() => null);
+        if (persistedRun && TERMINAL_RUN_STATUSES.has(persistedRun.status))
+          updateAssistant(run.runId, (message) => messageFromRun(message, persistedRun, t));
       } catch (error) {
         if (sessionId !== runSessionRef.current) return;
         if (!overrideText && rawText)
           setPrompt((current) => current || rawText);
+        if (!serverRunId && error instanceof RunLaunchTimeoutError) {
+          const reconciled = await reconcileRunLaunch(error.clientRequestId);
+          if (reconciled) {
+            serverRunId = reconciled.id;
+            replaceTrackedRun(runId, reconciled.id);
+            updateAssistant(runId, (assistant) => messageFromRun({ ...assistant, runId: reconciled.id }, reconciled, t));
+            shouldRecoverRun = !TERMINAL_RUN_STATUSES.has(reconciled.status);
+            if (shouldRecoverRun)
+              setRecoveryRunIds((current) => current.includes(reconciled.id) ? current : [...current, reconciled.id]);
+            else finishRun(reconciled.id);
+            return;
+          }
+          updateAssistant(runId, (assistant) => ({ ...assistant, isStreaming: false, runState: "unknown", lifecycle: "terminal", outcome: "unknown", delivery: "unavailable", sync: "lost", error: t("streamDisconnected"), durationMs: elapsedSince(assistant.createdAt) }));
+          finishRun(runId);
+          return;
+        }
         const messageRunId = serverRunId ?? runId;
         const aborted =
           error instanceof DOMException && error.name === "AbortError";
@@ -1259,6 +1679,9 @@ function App() {
           updateAssistant(messageRunId, (assistant) => ({
             ...assistant,
             isStreaming: false,
+            runState: "cancelled",
+            lifecycle: "terminal",
+            outcome: "cancelled",
             error: t("runCancelled"),
             durationMs: elapsedSince(assistant.createdAt),
           }));
@@ -1272,6 +1695,7 @@ function App() {
           updateAssistant(messageRunId, (assistant) => ({
             ...assistant,
             isStreaming: true,
+            sync: "reconnecting",
             error: undefined,
           }));
         } else {
@@ -1279,11 +1703,13 @@ function App() {
             ...assistant,
             isStreaming: false,
             error: backendAvailable
-              ? failureStage === "upload"
-                ? t("attachmentUploadFailed")
-                : failureStage === "stream"
-                  ? t("streamDisconnected")
-                  : t("runStartFailed")
+              ? isNetworkFailure(error)
+                ? t("backendOffline")
+                : failureStage === "upload"
+                  ? t("attachmentUploadFailed")
+                  : failureStage === "stream"
+                    ? t("streamDisconnected")
+                    : t("runStartFailed")
               : t("backendOffline"),
             durationMs: elapsedSince(assistant.createdAt),
           }));
@@ -1297,23 +1723,43 @@ function App() {
     },
     [
       attachments,
+      approvalMode,
       backendAvailable,
       capabilityState,
       clearSentAttachments,
       currentAgent?.defaultModelProfileId,
+      currentAgent?.defaultSkillIds,
       currentAgent?.id,
       defaultModelProfileId,
       ensureConversation,
+      executionMode,
       finishRun,
       handleRunEvent,
+      isPreflighting,
+      localExecutorNodeId,
+      nodesQuery,
       prompt,
       queryClient,
+      reconcileRunLaunch,
       replaceTrackedRun,
       setMessages,
       t,
       trackRun,
       updateAssistant,
     ],
+  );
+
+  const handleCapabilityChange = useCallback((next: CapabilityState) => {
+    setCapabilityState(next);
+    setSkillPreflight(null);
+  }, []);
+
+  const handleApprovalModeChange = useCallback(
+    (next: ApprovalMode) => {
+      setApprovalMode(next);
+      if (conversationId) writeConversationApprovalMode(conversationId, next);
+    },
+    [conversationId],
   );
 
   const handleCancelRun = useCallback(async (runId: string) => {
@@ -1396,10 +1842,14 @@ function App() {
         steps: [],
         isStreaming: true,
         runState: "queued",
+        lifecycle: "queued",
+        outcome: "unknown",
+        delivery: "unavailable",
+        sync: "live",
         createdAt: new Date().toISOString(),
       };
       setComposerNotice(message.attachmentIds?.length ? t("retryAttachmentsNotReused") : null);
-      setMessages([...useStudioStore.getState().messages, retryMessage]);
+      setMessages((messages) => [...messages, retryMessage]);
       trackRun(provisionalRunId);
       let serverRunId: string | null = null;
       let shouldRecoverRun = false;
@@ -1433,7 +1883,10 @@ function App() {
             updateAssistant(serverRunId, (current) => ({
               ...current,
               isStreaming: false,
-              runState: "cancelled",
+            runState: "cancelled",
+            lifecycle: "terminal",
+            outcome: "cancelled",
+            sync: "live",
               error: t("runCancelled"),
               durationMs: elapsedSince(current.createdAt),
             }));
@@ -1447,7 +1900,10 @@ function App() {
             updateAssistant(provisionalRunId, (current) => ({
               ...current,
               isStreaming: false,
-              runState: "failed",
+            runState: "interrupted",
+            lifecycle: "terminal",
+            outcome: "failed",
+            sync: "live",
               error: error instanceof Error ? error.message : t("runStartFailed"),
               durationMs: elapsedSince(current.createdAt),
             }));
@@ -1467,7 +1923,10 @@ function App() {
       if (!message.runId || !message.approvalId || approvingApprovalId) return;
       setApprovingApprovalId(message.approvalId);
       try {
-        await studioApi.decideNodeToolApproval(message.approvalId, approved);
+        const decideApproval = message.approvalId.startsWith("toolapproval_")
+          ? studioApi.decideToolApproval
+          : studioApi.decideNodeToolApproval;
+        await decideApproval(message.approvalId, approved);
         updateAssistant(message.runId, (current) => ({
           ...current,
           approvalDecision: approved ? "approved" : "rejected",
@@ -1496,7 +1955,7 @@ function App() {
       }
       const isImage = file.type.startsWith("image/");
       accepted.push({
-        id: `${file.name}-${file.size}-${file.lastModified}-${crypto.randomUUID()}`,
+        id: `${file.name}-${file.size}-${file.lastModified}-${createUuid()}`,
         file,
         name: file.name,
         type: file.type,
@@ -1699,28 +2158,31 @@ function App() {
             onScroll={handleConversationScroll}
           >
             <div className="message-feed">
-              {messages.map((message) => (
-                <MessageBlock
-                  key={message.id}
-                  message={message}
-                  expanded={expandedMessageId === message.id}
-                  onToggle={() =>
-                    setExpandedMessageId(
-                      expandedMessageId === message.id ? null : message.id,
-                    )
-                  }
-                  onCitation={setSourceCitationId}
-                  onCopy={() => void handleCopy(message)}
-                  onRetry={() => retryMessage(message)}
-                  onViewAudit={() => setAuditRunId(message.runId ?? null)}
-                  onCancelRun={handleCancelRun}
-                  onApproval={handleApproval}
-                  approving={approvingApprovalId === message.approvalId}
-                  cancelling={Boolean(message.runId && stoppingRunIds.includes(message.runId))}
-                  copied={copiedId === message.id}
-                  t={t}
-                />
-              ))}
+              {messages.map((message) => {
+                return (
+                  <Fragment key={message.id}>
+                    <MessageBlock
+                      message={message}
+                      expanded={expandedMessageId === message.id}
+                      onToggle={() =>
+                        setExpandedMessageId(
+                          expandedMessageId === message.id ? null : message.id,
+                        )
+                      }
+                      onCitation={setSourceCitationId}
+                      onCopy={() => void handleCopy(message)}
+                      onRetry={() => retryMessage(message)}
+                      onViewAudit={() => setAuditRunId(message.runId ?? null)}
+                      onCancelRun={handleCancelRun}
+                      onApproval={handleApproval}
+                      approving={approvingApprovalId === message.approvalId}
+                      cancelling={Boolean(message.runId && stoppingRunIds.includes(message.runId))}
+                      copied={copiedId === message.id}
+                      t={t}
+                    />
+                  </Fragment>
+                );
+              })}
               <ConversationAttachmentShelf
                 attachments={conversationAttachmentsQuery.data ?? []}
                 deleting={deleteConversationAttachment.isPending}
@@ -1731,7 +2193,7 @@ function App() {
             </div>
           </section>
           <span className="visually-hidden" role="status" aria-live="polite">
-            {composerNotice ?? (backendConnecting ? t("connecting") : isRunning ? t("running") : "")}
+            {composerNotice ?? (backendConnecting ? t("connecting") : activeConversationRunId ? t("running") : "")}
           </span>
           <Composer
             value={prompt}
@@ -1751,6 +2213,9 @@ function App() {
             attachments={attachments}
             onRemoveAttachment={removeAttachment}
             composerNotice={composerNotice}
+            preflighting={isPreflighting}
+            skillPreflight={skillPreflight}
+            agentToolAllowList={currentAgent?.toolAllowList}
             toolsQuery={toolsQuery}
             knowledgeBasesQuery={knowledgeBasesQuery}
             skillsQuery={skillsQuery}
@@ -1758,7 +2223,9 @@ function App() {
             nodesQuery={nodesQuery}
             executionMode={executionMode}
             capabilityState={capabilityState}
-            onCapabilityChange={setCapabilityState}
+            onCapabilityChange={handleCapabilityChange}
+            approvalMode={approvalMode}
+            onApprovalModeChange={handleApprovalModeChange}
           />
           </div>
           {settingsOpen ? (
@@ -1768,9 +2235,8 @@ function App() {
               agents={availableAgents}
               agentsQuery={agentsQuery}
               models={availableModels}
-              exposesNodes={exposesNodes}
-              executionSettings={executionSettingsQuery.data}
-              executionSettingsLoading={executionSettingsQuery.isLoading}
+              tools={toolsQuery.data ?? []}
+              executionMode={executionMode}
               onClose={closeConfiguration}
               t={t}
             />
@@ -1791,9 +2257,10 @@ function App() {
               evidence={auditEvidenceQuery.data}
               quality={auditQualityQuery.data}
               audit={auditQuery.data}
+              workflow={auditWorkflowQuery.data}
               artifacts={auditQuery.data?.artifacts}
-              loading={auditEvidenceQuery.isLoading || auditQualityQuery.isLoading || auditQuery.isLoading}
-              error={auditEvidenceQuery.isError || auditQualityQuery.isError || auditQuery.isError}
+              loading={auditEvidenceQuery.isLoading || auditQualityQuery.isLoading || auditQuery.isLoading || auditWorkflowQuery.isLoading}
+              error={auditEvidenceQuery.isError || auditQualityQuery.isError || auditQuery.isError || auditWorkflowQuery.isError}
               onDownload={(artifact) => void handleDownloadArtifact(artifact)}
               onClose={() => setAuditRunId(null)}
               t={t}
@@ -2441,6 +2908,7 @@ function MessageBlock({
   const steps = message.steps ?? [];
   const queued = message.runState === "queued";
   const waitingApproval = message.runState === "waitingApproval";
+  const unknown = message.runState === "unknown";
   const needsVerification = message.runState === "needsVerification";
   const cancelled = message.runState === "cancelled";
   const canCancel = Boolean(
@@ -2448,11 +2916,11 @@ function MessageBlock({
       !message.runId.startsWith("pending-") &&
       (message.runState === "queued" || message.runState === "running" || waitingApproval),
   );
-  const failed = message.runState === "failed" || Boolean(message.error && !cancelled);
+  const failed = message.runState === "failed" || message.runState === "timedOut" || message.runState === "interrupted";
   const canRetry = Boolean(
     message.runId &&
       !message.runId.startsWith("pending-") &&
-      (failed || cancelled || needsVerification),
+      (failed || cancelled || needsVerification) && !unknown,
   );
   const hasRunning =
     !queued &&
@@ -2465,6 +2933,7 @@ function MessageBlock({
     !queued &&
     !waitingApproval &&
     !needsVerification &&
+    !unknown &&
     !failed;
   const executionLabel = queued
     ? message.queuePosition && message.queuePosition > 1
@@ -2472,6 +2941,8 @@ function MessageBlock({
       : t("queued")
     : waitingApproval
     ? t("waitingApproval")
+    : unknown
+      ? t("runStatusUnknown")
     : needsVerification
       ? t("needsVerification")
       : hasRunning
@@ -2485,6 +2956,8 @@ function MessageBlock({
     ? "is-waiting"
     : waitingApproval
     ? "is-waiting"
+    : unknown
+      ? "is-warning"
     : needsVerification
       ? "is-warning"
       : hasRunning
@@ -2507,7 +2980,7 @@ function MessageBlock({
       }}
     >
       {steps.length ? (
-        <div className="execution-block">
+        <div className={`execution-block ${hasRunning ? "is-active" : ""}`}>
           <button
             className="execution-summary"
             type="button"
@@ -2521,14 +2994,15 @@ function MessageBlock({
                 <LoaderCircle size={15} className="spin" />
               ) : cancelled ? (
                 <CircleStop size={15} />
-              ) : queued || waitingApproval || needsVerification || failed ? (
+              ) : queued || waitingApproval || needsVerification || unknown || failed ? (
                 <CircleAlert size={15} />
               ) : (
                 <Check size={15} />
               )}
             </span>
-            <span>
-              {executionLabel} {steps.length} {t("stepCount")}
+            <span className="execution-summary-copy">
+              <strong>{executionLabel}</strong>
+              <span>{steps.length} {t("stepCount")}</span>
             </span>
             {message.durationMs ? (
               <span className="execution-meta">
@@ -2605,6 +3079,16 @@ function MessageBlock({
           <span />
         </div>
       ) : null}
+      {needsVerification && message.deliveryGate ? (
+        <div className="delivery-gate" role="alert">
+          <strong>{t("needsVerification")}</strong>
+          {message.deliveryGate.missingEvidence?.length ? (
+            <ul>{message.deliveryGate.missingEvidence.map((item) => <li key={item}>{item}</li>)}</ul>
+          ) : message.deliveryGate.reasons?.length ? (
+            <ul>{message.deliveryGate.reasons.map((item) => <li key={item}>{item}</li>)}</ul>
+          ) : null}
+        </div>
+      ) : null}
       {message.error ? (
         <div
           className={`run-error ${cancelled ? "is-cancelled" : ""}`}
@@ -2630,21 +3114,20 @@ function MessageBlock({
       {message.content || canRetry || canCancel ? (
         <div className="message-actions">
           {message.content ? (
-            <button type="button" onClick={onCopy}>
-              {copied ? <Check size={14} /> : <Copy size={14} />}{" "}
-              {copied ? t("copied") : t("copy")}
-            </button>
+            <IconButton label={copied ? t("copied") : t("copy")} onClick={onCopy}>
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+            </IconButton>
           ) : null}
           {canRetry ? (
-            <button type="button" onClick={onRetry}>
-              <RotateCcw size={14} /> {t("retry")}
-            </button>
+            <IconButton label={t("retry")} onClick={onRetry}>
+              <RotateCcw size={14} />
+            </IconButton>
           ) : null}
           {message.runId && !message.runId.startsWith("pending-") ? (
             <DropdownMenu.Root>
               <DropdownMenu.Trigger asChild>
-                <button type="button" aria-label={t("more")}>
-                  <MoreHorizontal size={14} /> {t("more")}
+                <button className="icon-button" type="button" aria-label={t("more")} title={t("more")}>
+                  <MoreHorizontal size={14} />
                 </button>
               </DropdownMenu.Trigger>
               <DropdownMenu.Portal>
@@ -2748,6 +3231,9 @@ function Composer({
   attachments,
   onRemoveAttachment,
   composerNotice,
+  preflighting,
+  skillPreflight,
+  agentToolAllowList,
   toolsQuery,
   knowledgeBasesQuery,
   skillsQuery,
@@ -2756,6 +3242,8 @@ function Composer({
   executionMode,
   capabilityState,
   onCapabilityChange,
+  approvalMode,
+  onApprovalModeChange,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -2774,6 +3262,9 @@ function Composer({
   attachments: Attachment[];
   onRemoveAttachment: (id: string) => void;
   composerNotice: string | null;
+  preflighting: boolean;
+  skillPreflight: SkillPreflight | null;
+  agentToolAllowList?: string[];
   toolsQuery: { data?: Tool[] };
   knowledgeBasesQuery: { data?: KnowledgeBase[] };
   skillsQuery: { data?: Skill[] };
@@ -2782,6 +3273,8 @@ function Composer({
   executionMode: ExecutionMode;
   capabilityState: CapabilityState;
   onCapabilityChange: (state: CapabilityState) => void;
+  approvalMode: ApprovalMode;
+  onApprovalModeChange: (mode: ApprovalMode) => void;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -2790,7 +3283,7 @@ function Composer({
     const textarea = textareaRef.current;
     if (!textarea) return;
     textarea.style.height = "0px";
-    textarea.style.height = `${Math.min(textarea.scrollHeight, 170)}px`;
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
   }, [textareaRef, value]);
 
   const totalCapabilities =
@@ -2800,7 +3293,7 @@ function Composer({
     capabilityState.toolNames.length +
     (executionMode !== "PERSONAL_LOCAL" && capabilityState.nodeId ? 1 : 0);
   const builtInTools = (toolsQuery.data ?? []).filter(
-    (tool) => !tool.name.startsWith("mcp:") && !tool.name.startsWith("node:"),
+    (tool) => !isExternalToolName(tool.name),
   );
   const selectedCapabilityChips = [
     ...(knowledgeBasesQuery.data ?? [])
@@ -2860,47 +3353,18 @@ function Composer({
           onAttach(files);
         }}
       >
-        <div className="composer-toolbar">
-          <input
-            ref={fileRef}
-            type="file"
-            className="visually-hidden"
-            aria-hidden="true"
-            tabIndex={-1}
-            multiple
-            onChange={(event) => {
-              onAttach(Array.from(event.target.files ?? []));
-              event.currentTarget.value = "";
-            }}
-          />
-          <IconButton
-            label={t("attach")}
-            onClick={() => fileRef.current?.click()}
-          >
-            <Paperclip size={16} />
-          </IconButton>
-          <CapabilityMenu
-            tools={builtInTools}
-            knowledgeBases={knowledgeBasesQuery.data ?? []}
-            skills={skillsQuery.data ?? []}
-            mcpConnections={mcpQuery.data ?? []}
-            nodes={
-              executionMode !== "PERSONAL_LOCAL"
-                ? (nodesQuery.data ?? []).filter(
-                    (node) =>
-                      node.kind !== "MANAGED_LOCAL" &&
-                      node.enabled &&
-                      node.status?.toUpperCase() === "ONLINE",
-                  )
-                : []
-            }
-            executionMode={executionMode}
-            state={capabilityState}
-            onChange={onCapabilityChange}
-            t={t}
-          />
-          <span className="composer-spacer" />
-        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          className="visually-hidden"
+          aria-hidden="true"
+          tabIndex={-1}
+          multiple
+          onChange={(event) => {
+            onAttach(Array.from(event.target.files ?? []));
+            event.currentTarget.value = "";
+          }}
+        />
         {selectedCapabilityChips.length ? (
           <div className="selected-capability-row" aria-label={t("capabilityTitle")}>
             {selectedCapabilityChips.map((chip) => (
@@ -2947,42 +3411,71 @@ function Composer({
             ))}
           </div>
         ) : null}
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-          onPaste={(event) => {
-            const files = Array.from(event.clipboardData.files);
-            if (!files.length) return;
-            event.preventDefault();
-            onAttach(files);
-          }}
-          onKeyDown={onKeyDown}
-          placeholder={t("placeholder")}
-          rows={1}
-          aria-label={t("placeholder")}
-        />
-        <div className="composer-footer">
-          <span className="composer-context">
-            {connecting ? <LoaderCircle size={12} className="spin" /> : <span className="context-dot" data-online={backendAvailable} />}
-            <span className="composer-connection-label">
-              {connecting ? t("connecting") : backendAvailable ? t("backendOnline") : t("offline")}
-            </span>
-            {!backendAvailable && !connecting ? (
+        {approvalMode === "full-access" ? (
+          <div className="selected-capability-row" aria-label={t("approvalMode")}>
+            <span className="selected-capability-chip">
+              <ShieldCheck size={12} />
+              <span className="selected-capability-kind">{t("approvalMode")}</span>
+              <span>{t("fullAccess")}</span>
               <button
                 type="button"
-                className="connection-retry"
-                onClick={onReconnect}
-                disabled={reconnecting}
+                aria-label={t("restoreApproval")}
+                title={t("restoreApproval")}
+                onClick={() => onApprovalModeChange("on-request")}
               >
-                {reconnecting ? <LoaderCircle size={12} className="spin" /> : null}
-                {reconnecting ? t("reconnecting") : t("reconnect")}
+                <X size={12} />
               </button>
-            ) : null}
-            {totalCapabilities ? (
-              <span className="capability-count">+{totalCapabilities}</span>
-            ) : null}
-          </span>
+            </span>
+          </div>
+        ) : null}
+        <div className="composer-input-row">
+          <IconButton
+            label={t("attach")}
+            onClick={() => fileRef.current?.click()}
+          >
+            <Paperclip size={17} />
+          </IconButton>
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            onPaste={(event) => {
+              const files = Array.from(event.clipboardData.files);
+              if (!files.length) return;
+              event.preventDefault();
+              onAttach(files);
+            }}
+            onKeyDown={onKeyDown}
+            placeholder={t("placeholder")}
+            rows={1}
+            aria-label={t("placeholder")}
+          />
+          <CapabilityMenu
+            tools={builtInTools.filter((tool) =>
+              agentToolAllowList ? agentToolAllowList.includes(tool.name) : true,
+            )}
+            knowledgeBases={knowledgeBasesQuery.data ?? []}
+            skills={skillsQuery.data ?? []}
+            mcpConnections={mcpQuery.data ?? []}
+            nodes={
+              executionMode !== "PERSONAL_LOCAL"
+                ? (nodesQuery.data ?? []).filter(
+                    (node) =>
+                      node.kind !== "MANAGED_LOCAL" &&
+                      node.enabled &&
+                      node.status?.toUpperCase() === "ONLINE",
+                  )
+                : []
+            }
+            executionMode={executionMode}
+            state={capabilityState}
+            onChange={onCapabilityChange}
+            t={t}
+            count={totalCapabilities}
+            skillPreflight={skillPreflight}
+            approvalMode={approvalMode}
+            onApprovalModeChange={onApprovalModeChange}
+          />
           {running ? (
             <button
               type="button"
@@ -2997,19 +3490,37 @@ function Composer({
                 <CircleStop size={17} />
               )}
             </button>
-          ) : null}
-          <button
-            type="button"
-            className="send-button"
-            onClick={onSend}
-            disabled={
-              !backendAvailable || (!value.trim() && !attachments.length)
-            }
-            aria-label={t("send")}
-          >
-            <ArrowUp size={17} />
-          </button>
+          ) : (
+            <button
+              type="button"
+              className="send-button"
+              onClick={onSend}
+              disabled={
+                preflighting || !backendAvailable || (!value.trim() && !attachments.length)
+              }
+              aria-label={preflighting ? t("preflightingSkills") : t("send")}
+            >
+              {preflighting ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={17} />}
+            </button>
+          )}
         </div>
+        {!backendAvailable || connecting ? (
+          <div className="composer-status">
+            {connecting ? <LoaderCircle size={12} className="spin" /> : <span className="context-dot" data-online={backendAvailable} />}
+            <span>{connecting ? t("connecting") : t("offline")}</span>
+            {!backendAvailable && !connecting ? (
+              <button
+                type="button"
+                className="connection-retry"
+                onClick={onReconnect}
+                disabled={reconnecting}
+              >
+                {reconnecting ? <LoaderCircle size={12} className="spin" /> : null}
+                {reconnecting ? t("reconnecting") : t("reconnect")}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {composerNotice ? (
           <div className="composer-notice" role="status" aria-live="polite">
             <CircleAlert size={13} />
@@ -3031,6 +3542,10 @@ function CapabilityMenu({
   state,
   onChange,
   t,
+  count,
+  skillPreflight,
+  approvalMode,
+  onApprovalModeChange,
 }: {
   tools: Tool[];
   knowledgeBases: KnowledgeBase[];
@@ -3041,7 +3556,13 @@ function CapabilityMenu({
   state: CapabilityState;
   onChange: (state: CapabilityState) => void;
   t: (key: string) => string;
+  count: number;
+  skillPreflight: SkillPreflight | null;
+  approvalMode: ApprovalMode;
+  onApprovalModeChange: (mode: ApprovalMode) => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [confirmingFullAccess, setConfirmingFullAccess] = useState(false);
   const toggle = (key: CapabilityArrayKey, id: string, checked: boolean) =>
     onChange({
       ...state,
@@ -3049,12 +3570,35 @@ function CapabilityMenu({
         ? [...state[key], id]
         : state[key].filter((item) => item !== id),
     });
+  const clearSelection = () =>
+    onChange({
+      knowledgeBaseIds: [],
+      skillIds: [],
+      mcpServerIds: [],
+      toolNames: [],
+      nodeId: executionMode === "NODES_ONLY" ? state.nodeId : undefined,
+    });
+  const matches = (label: string, detail: string) =>
+    !query.trim() ||
+    `${label} ${detail}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+  const availableCapabilityCount =
+    knowledgeBases.length +
+    tools.length +
+    skills.filter((skill) => skill.enabled).length +
+    mcpConnections.filter((connection) => connection.enabled).length +
+    nodes.length;
   return (
+    <>
     <DropdownMenu.Root>
       <DropdownMenu.Trigger asChild>
-        <button type="button" className="capability-button">
+        <button
+          type="button"
+          className="capability-button"
+          aria-label={t("chooseCapability")}
+        >
           <Zap size={14} />
-          {t("chooseCapability")}
+          <span className="capability-button-label">{t("chooseCapability")}</span>
+          {count ? <span className="capability-count">{count}</span> : null}
           <ChevronDown size={12} />
         </button>
       </DropdownMenu.Trigger>
@@ -3064,14 +3608,76 @@ function CapabilityMenu({
           align="start"
           sideOffset={8}
         >
-          <DropdownMenu.Label className="menu-label">
-            {t("capabilityTitle")}
-          </DropdownMenu.Label>
+          <div className="capability-menu-header">
+            <DropdownMenu.Label className="menu-label">
+              {t("capabilityTitle")}
+            </DropdownMenu.Label>
+            {count ? (
+              <button type="button" className="capability-clear" onClick={clearSelection}>
+                {t("clearSelection")}
+              </button>
+            ) : null}
+          </div>
           <p className="capability-hint">{t("capabilityHint")}</p>
-          {knowledgeBases.length ? (
+          <div className="capability-group">
+            <div className="capability-group-title">{t("approvalMode")}</div>
+            <DropdownMenu.RadioGroup
+              value={approvalMode}
+              onValueChange={(value) => {
+                if (value === "full-access" && approvalMode !== "full-access") {
+                  setConfirmingFullAccess(true);
+                  return;
+                }
+                onApprovalModeChange(value as ApprovalMode);
+              }}
+            >
+              <DropdownMenu.RadioItem value="on-request" className="capability-item">
+                <DropdownMenu.ItemIndicator className="item-indicator">
+                  <Check size={13} />
+                </DropdownMenu.ItemIndicator>
+                <span>
+                  <strong>{t("approvalOnRequest")}</strong>
+                  <small>{t("approvalOnRequestHint")}</small>
+                </span>
+              </DropdownMenu.RadioItem>
+              <DropdownMenu.RadioItem value="full-access" className="capability-item">
+                <DropdownMenu.ItemIndicator className="item-indicator">
+                  <Check size={13} />
+                </DropdownMenu.ItemIndicator>
+                <span>
+                  <strong>{t("fullAccess")}</strong>
+                  <small>{t("fullAccessHint")}</small>
+                </span>
+              </DropdownMenu.RadioItem>
+            </DropdownMenu.RadioGroup>
+          </div>
+          {skillPreflight && !skillPreflight.ready ? (
+            <div className="capability-preflight" role="status">
+              <CircleAlert size={13} />
+              <div>
+                <strong>{t("skillPreflightIssues")}</strong>
+                {skillPreflight.compatibility.issues.map((issue) => (
+                  <span key={`${issue.skillId}-${issue.code}`}>{issue.message}</span>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {availableCapabilityCount > 6 ? (
+            <label className="capability-search">
+              <Search size={14} />
+              <span className="visually-hidden">{t("searchCapabilities")}</span>
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                onKeyDown={(event) => event.stopPropagation()}
+                placeholder={t("searchCapabilities")}
+              />
+            </label>
+          ) : null}
+          {knowledgeBases.filter((base) => matches(base.name, base.description ?? "")).length ? (
             <CapabilityGroup
               title={t("knowledge")}
-              items={knowledgeBases.map((base) => ({
+              items={knowledgeBases.filter((base) => matches(base.name, base.description ?? "")).map((base) => ({
                 id: base.id,
                 label: base.name,
                 detail: base.description ?? "",
@@ -3081,10 +3687,10 @@ function CapabilityMenu({
               onToggle={toggle}
             />
           ) : null}
-          {tools.length ? (
+          {tools.filter((tool) => matches(tool.name, tool.description)).length ? (
             <CapabilityGroup
               title={t("builtInTools")}
-              items={tools.map((tool) => ({
+              items={tools.filter((tool) => matches(tool.name, tool.description)).map((tool) => ({
                 id: tool.name,
                 label: tool.name,
                 detail: tool.description,
@@ -3094,11 +3700,11 @@ function CapabilityMenu({
               onToggle={toggle}
             />
           ) : null}
-          {skills.length ? (
+          {skills.filter((skill) => skill.enabled && matches(skill.name, skill.description)).length ? (
             <CapabilityGroup
               title={t("installedSkills")}
               items={skills
-                .filter((skill) => skill.enabled)
+                .filter((skill) => skill.enabled && matches(skill.name, skill.description))
                 .map((skill) => ({
                   id: skill.id,
                   label: skill.name,
@@ -3109,11 +3715,11 @@ function CapabilityMenu({
               onToggle={toggle}
             />
           ) : null}
-          {mcpConnections.length ? (
+          {mcpConnections.filter((connection) => connection.enabled && matches(connection.name, connection.description ?? connection.status ?? "")).length ? (
             <CapabilityGroup
               title={t("mcpConnections")}
               items={mcpConnections
-                .filter((connection) => connection.enabled)
+                .filter((connection) => connection.enabled && matches(connection.name, connection.description ?? connection.status ?? ""))
                 .map((connection) => ({
                   id: connection.id,
                   label: connection.name,
@@ -3183,6 +3789,38 @@ function CapabilityMenu({
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
+    <Dialog.Root open={confirmingFullAccess} onOpenChange={setConfirmingFullAccess}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="dialog-overlay" />
+        <Dialog.Content className="utility-dialog approval-mode-dialog">
+          <div className="dialog-header">
+            <div>
+              <Dialog.Title>{t("confirmFullAccess")}</Dialog.Title>
+              <Dialog.Description>{t("confirmFullAccessHint")}</Dialog.Description>
+            </div>
+          </div>
+          <div className="dialog-actions">
+            <Dialog.Close asChild>
+              <button type="button" className="secondary-button">
+                {t("cancel")}
+              </button>
+            </Dialog.Close>
+            <button
+              type="button"
+              className="danger-button"
+              onClick={() => {
+                onApprovalModeChange("full-access");
+                setConfirmingFullAccess(false);
+              }}
+            >
+              <ShieldCheck size={14} />
+              {t("enableFullAccess")}
+            </button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+    </>
   );
 }
 
@@ -3230,9 +3868,8 @@ function ConfigurationWorkspace({
   agents,
   agentsQuery,
   models,
-  executionSettings,
-  executionSettingsLoading,
-  exposesNodes,
+  tools,
+  executionMode,
   onClose,
   t,
 }: {
@@ -3241,20 +3878,12 @@ function ConfigurationWorkspace({
   agents: Agent[];
   agentsQuery: { isLoading: boolean; isError: boolean; refetch: () => unknown };
   models: ModelProfile[];
-  executionSettings?: ExecutionSettings;
-  executionSettingsLoading: boolean;
-  exposesNodes: boolean;
+  tools: Tool[];
+  executionMode: ExecutionMode;
   onClose: () => void;
   t: (key: string) => string;
 }) {
   const queryClient = useQueryClient();
-  const executionSettingsMutation = useMutation({
-    mutationFn: (mode: ExecutionMode) => studioApi.updateExecutionSettings(mode),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["execution-settings"] });
-      void queryClient.invalidateQueries({ queryKey: ["nodes"] });
-    },
-  });
   const [compactNavigation, setCompactNavigation] = useState(
     () => window.matchMedia("(max-width: 1199px)").matches,
   );
@@ -3262,7 +3891,7 @@ function ConfigurationWorkspace({
   const skillsQuery = useQuery({
     queryKey: ["skills"],
     queryFn: studioApi.listSkills,
-    enabled: tab === "skills",
+    enabled: tab === "skills" || tab === "agents",
   });
   const mcpQuery = useQuery({
     queryKey: ["mcp-connections"],
@@ -3277,12 +3906,14 @@ function ConfigurationWorkspace({
   const nodesQuery = useQuery({
     queryKey: ["nodes"],
     queryFn: studioApi.listNodes,
-    enabled: exposesNodes && tab === "nodes",
+    enabled: tab === "nodes",
+    refetchInterval: tab === "nodes" ? 5_000 : false,
   });
   const approvalsQuery = useQuery({
     queryKey: ["node-tool-approvals"],
     queryFn: studioApi.listNodeToolApprovals,
-    enabled: exposesNodes && tab === "nodes",
+    enabled: tab === "nodes",
+    refetchInterval: tab === "nodes" ? 5_000 : false,
   });
   const toggleSkill = useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
@@ -3298,6 +3929,8 @@ function ConfigurationWorkspace({
   const refreshMcp = useMutation({
     mutationFn: (id: string) => studioApi.refreshMcpTools(id),
     onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["mcp-connections"] }),
+    onError: () =>
       queryClient.invalidateQueries({ queryKey: ["mcp-connections"] }),
   });
   const toggleModel = useMutation({
@@ -3329,9 +3962,8 @@ function ConfigurationWorkspace({
     { id: "skills", icon: Sparkles, label: t("skills") },
     { id: "mcp", icon: Globe2, label: t("mcp") },
     { id: "knowledge", icon: Database, label: t("knowledge") },
-    { id: "runtime", icon: HardDrive, label: t("executionEnvironment") },
     { id: "models", icon: TerminalSquare, label: t("models") },
-    ...(exposesNodes ? [{ id: "nodes", icon: HardDrive, label: t("nodes") }] : []),
+    { id: "nodes", icon: HardDrive, label: t("nodes") },
   ];
   const submitKnowledge = form.handleSubmit((values) => {
     const parsed = knowledgeSchema.safeParse(values);
@@ -3347,9 +3979,6 @@ function ConfigurationWorkspace({
   useEffect(() => {
     headingRef.current?.focus();
   }, []);
-  useEffect(() => {
-    if (!exposesNodes && tab === "nodes") setTab("agents");
-  }, [exposesNodes, setTab, tab]);
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -3423,10 +4052,8 @@ function ConfigurationWorkspace({
                     id={id}
                     agents={agents}
                     models={models}
-                    executionSettings={executionSettings}
-                    executionSettingsLoading={executionSettingsLoading}
-                    executionSettingsSaving={executionSettingsMutation.isPending}
-                    onExecutionModeChange={(mode) => executionSettingsMutation.mutate(mode)}
+                    tools={tools}
+                    executionMode={executionMode}
                     skills={skillsQuery.data}
                     mcpConnections={mcpQuery.data}
                     knowledgeBases={knowledgeQuery.data}
@@ -3442,6 +4069,9 @@ function ConfigurationWorkspace({
                     onSkillToggle={(item) => toggleSkill.mutate(item)}
                     onMcpToggle={(item) => toggleMcp.mutate(item)}
                     onMcpRefresh={(id) => refreshMcp.mutate(id)}
+                    mcpRefreshing={refreshMcp.isPending}
+                    mcpRefreshingId={refreshMcp.variables}
+                    mcpRefreshError={refreshMcp.error}
                     onModelToggle={(item) => toggleModel.mutate(item)}
                     onSetDefault={(id) => setDefaultModel.mutate(id)}
                     creatingKnowledge={creatingKnowledge}
@@ -3497,10 +4127,8 @@ function ManagerPanelBody({
   id,
   agents,
   models,
-  executionSettings,
-  executionSettingsLoading,
-  executionSettingsSaving,
-  onExecutionModeChange,
+  tools,
+  executionMode,
   skills,
   mcpConnections,
   knowledgeBases,
@@ -3509,6 +4137,9 @@ function ManagerPanelBody({
   onSkillToggle,
   onMcpToggle,
   onMcpRefresh,
+  mcpRefreshing,
+  mcpRefreshingId,
+  mcpRefreshError,
   onModelToggle,
   onSetDefault,
   creatingKnowledge,
@@ -3520,10 +4151,8 @@ function ManagerPanelBody({
   id: string;
   agents: Agent[];
   models: ModelProfile[];
-  executionSettings?: ExecutionSettings;
-  executionSettingsLoading: boolean;
-  executionSettingsSaving: boolean;
-  onExecutionModeChange: (mode: ExecutionMode) => void;
+  tools: Tool[];
+  executionMode: ExecutionMode;
   skills?: Skill[];
   mcpConnections?: McpConnection[];
   knowledgeBases?: KnowledgeBase[];
@@ -3535,6 +4164,9 @@ function ManagerPanelBody({
   onSkillToggle: (item: { id: string; enabled: boolean }) => void;
   onMcpToggle: (item: { id: string; enabled: boolean }) => void;
   onMcpRefresh: (id: string) => void;
+  mcpRefreshing: boolean;
+  mcpRefreshingId?: string;
+  mcpRefreshError: unknown;
   onModelToggle: (item: { id: string; enabled: boolean }) => void;
   onSetDefault: (id: string) => void;
   creatingKnowledge: boolean;
@@ -3545,82 +4177,9 @@ function ManagerPanelBody({
   knowledgeSubmitting: boolean;
   t: (key: string) => string;
 }) {
-  const [inspectedAgentId, setInspectedAgentId] = useState<string | null>(
-    null,
-  );
-  const inspectedAgent = agents.find((agent) => agent.id === inspectedAgentId);
-  const inspectedModel = inspectedAgent
-    ? models.find((model) => model.id === inspectedAgent.defaultModelProfileId)
-    : undefined;
-
   if (id === "agents")
     return (
-      <div className="agent-manager">
-        <QueryResourceState query={queries.agents} t={t}>
-          {agents.map((agent) => (
-            <ResourceRow
-              key={agent.id}
-              icon={<Bot size={15} />}
-              title={agent.name}
-              detail={agent.description}
-              trailing={
-                <span className="row-actions">
-                  <span className="list-status">
-                    <span className="status-dot" data-online={agent.enabled} />
-                    {agent.enabled ? t("online") : t("disabled")}
-                  </span>
-                  <button
-                    type="button"
-                    className="text-button"
-                    onClick={() => setInspectedAgentId(agent.id)}
-                  >
-                    {t("viewAgentConfig")}
-                  </button>
-                </span>
-              }
-            />
-          ))}
-        </QueryResourceState>
-        {inspectedAgent ? (
-          <section className="agent-inspector" aria-label={t("agentConfiguration")}>
-            <div className="agent-inspector-header">
-              <div>
-                <h4>{inspectedAgent.name}</h4>
-                <p>{t("agentConfiguration")}</p>
-              </div>
-              <IconButton
-                label={t("close")}
-                onClick={() => setInspectedAgentId(null)}
-              >
-                <X size={15} />
-              </IconButton>
-            </div>
-            <div className="agent-inspector-grid">
-              <div className="agent-inspector-field">
-                <span>{t("description")}</span>
-                <strong>{inspectedAgent.description || t("noDescription")}</strong>
-              </div>
-              <div className="agent-inspector-field">
-                <span>{t("agentDefaultModel")}</span>
-                <strong>
-                  {inspectedModel?.modelName ?? inspectedAgent.defaultModelProfileId}
-                </strong>
-              </div>
-              <div className="agent-inspector-field">
-                <span>{t("agentTools")}</span>
-                <strong>{inspectedAgent.toolAllowList || t("noDescription")}</strong>
-              </div>
-            </div>
-            <div className="agent-inspector-field">
-              <span>{t("agentSystemPrompt")}</span>
-              <pre className="agent-prompt">
-                {inspectedAgent.systemPrompt || t("noDescription")}
-              </pre>
-            </div>
-            <p className="agent-readonly-note">{t("agentReadOnlyHint")}</p>
-          </section>
-        ) : null}
-      </div>
+      <AgentManager agents={agents} models={models} skills={skills ?? []} tools={tools} query={queries.agents} t={t} />
     );
   if (id === "skills")
     return (
@@ -3638,6 +4197,9 @@ function ManagerPanelBody({
         query={queries.mcp}
         onToggle={onMcpToggle}
         onRefresh={onMcpRefresh}
+        refreshing={mcpRefreshing}
+        refreshingId={mcpRefreshingId}
+        refreshError={mcpRefreshError}
         t={t}
       />
     );
@@ -3686,16 +4248,6 @@ function ManagerPanelBody({
         />
       </div>
     );
-  if (id === "runtime")
-    return (
-      <ExecutionEnvironmentManager
-        settings={executionSettings}
-        loading={executionSettingsLoading}
-        saving={executionSettingsSaving}
-        onChange={onExecutionModeChange}
-        t={t}
-      />
-    );
   if (id === "models")
     return (
       <ModelManager
@@ -3718,84 +4270,15 @@ function ManagerPanelBody({
         nodes={nodes ?? []}
         nodesQuery={queries.nodes}
         approvalsQuery={queries.approvals}
+        managedLocalExecutorAvailable={executionMode !== "NODES_ONLY"}
         t={t}
       />
     </Suspense>
   );
 }
 
-function ExecutionEnvironmentManager({
-  settings,
-  loading,
-  saving,
-  onChange,
-  t,
-}: {
-  settings?: ExecutionSettings;
-  loading: boolean;
-  saving: boolean;
-  onChange: (mode: ExecutionMode) => void;
-  t: (key: string) => string;
-}) {
-  if (loading)
-    return (
-      <div className="manager-placeholder">
-        <LoaderCircle size={18} className="spin" />
-        <span>{t("loading")}</span>
-      </div>
-    );
-
-  const value = settings?.mode ?? "PERSONAL_LOCAL";
-  const options: Array<{ mode: ExecutionMode; label: string; hint: string }> = [
-    {
-      mode: "PERSONAL_LOCAL",
-      label: t("personalLocalMode"),
-      hint: t("personalLocalModeHint"),
-    },
-    {
-      mode: "LOCAL_AND_NODES",
-      label: t("localAndNodesMode"),
-      hint: t("localAndNodesModeHint"),
-    },
-    {
-      mode: "NODES_ONLY",
-      label: t("nodesOnlyMode"),
-      hint: t("nodesOnlyModeHint"),
-    },
-  ];
-
-  return (
-    <section className="execution-environment-manager" aria-label={t("executionEnvironment")}>
-      <div className="execution-mode-list" role="radiogroup" aria-label={t("executionEnvironment")}>
-        {options.map((option) => {
-          const selected = option.mode === value;
-          return (
-            <button
-              key={option.mode}
-              type="button"
-              className={`execution-mode-option ${selected ? "is-selected" : ""}`}
-              role="radio"
-              aria-checked={selected}
-              disabled={saving}
-              onClick={() => onChange(option.mode)}
-            >
-              <span>
-                <strong>{option.label}</strong>
-                <small>{option.hint}</small>
-              </span>
-              {selected ? <Check size={16} aria-hidden="true" /> : null}
-            </button>
-          );
-        })}
-      </div>
-      {saving ? (
-        <p className="execution-mode-saving" role="status">
-          <LoaderCircle size={14} className="spin" />
-          {t("executionModeSaving")}
-        </p>
-      ) : null}
-    </section>
-  );
+function isExternalToolName(name: string) {
+  return name.startsWith("mcp:") || name.startsWith("mcp_") || name.startsWith("node:") || name.startsWith("node_");
 }
 
 type ModelFormValues = {
@@ -3804,7 +4287,7 @@ type ModelFormValues = {
   baseUrl: string;
   modelName: string;
   credentialRef: string;
-  apiKey?: string;
+  apiKey: string;
   capabilities: ModelCapability[];
   enabled: boolean;
 };
@@ -3814,7 +4297,7 @@ const modelFormSchema = z.object({
   providerType: z.enum(["OPENAI_COMPATIBLE", "OLLAMA"]),
   baseUrl: z.string().trim().url(),
   modelName: z.string().trim().min(1),
-  credentialRef: z.string().trim().min(1),
+  credentialRef: z.string().trim().optional(),
   apiKey: z.string().optional(),
   capabilities: z.array(z.string()).min(1),
   enabled: z.boolean(),
@@ -3849,6 +4332,7 @@ function ModelManager({
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [testResult, setTestResult] = useState<ModelTestResult | null>(null);
+  const [savedModelId, setSavedModelId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ModelProfile | null>(null);
   const presetsQuery = useQuery({
     queryKey: ["model-presets"],
@@ -3858,10 +4342,12 @@ function ModelManager({
   const form = useForm<ModelFormValues>({ defaultValues: emptyModelForm });
   const saveMutation = useMutation({
     mutationFn: studioApi.saveModel,
-    onSuccess: () => {
+    onSuccess: (model) => {
       queryClient.invalidateQueries({ queryKey: ["models"] });
       setEditorOpen(false);
       setNotice(t("modelSaved"));
+      setSavedModelId(model.id);
+      setTestResult(null);
       setError("");
     },
     onError: () => setError(t("modelSaveFailed")),
@@ -3883,7 +4369,12 @@ function ModelManager({
       setTestResult(result);
       setError("");
     },
-    onError: () => setError(t("modelTestFailed")),
+    onError: (failure) =>
+      setError(
+        failure instanceof Error && failure.message
+          ? failure.message
+          : t("modelTestFailed"),
+      ),
   });
   const capabilities = form.watch("capabilities");
   const fieldError = (field: keyof ModelFormValues) =>
@@ -3917,6 +4408,8 @@ function ModelManager({
     );
     setEditingId(model?.id ?? null);
     setEditorOpen(true);
+    setSavedModelId(null);
+    setTestResult(null);
     setError("");
   };
   const submit = form.handleSubmit((values) => {
@@ -3925,9 +4418,10 @@ function ModelManager({
       setError(t("loadFailed"));
       return;
     }
+    const { apiKey, ...model } = parsed.data;
     saveMutation.mutate({
-      ...parsed.data,
-      apiKey: parsed.data.apiKey?.trim() || undefined,
+      ...model,
+      ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
       capabilities: parsed.data.capabilities,
     });
   });
@@ -3983,6 +4477,21 @@ function ModelManager({
         <div className="manager-notice success">
           <CheckCircle2 size={14} />
           {notice}
+          {savedModelId ? (
+            <button
+              type="button"
+              className="text-button model-save-notice-action"
+              disabled={testMutation.isPending}
+              onClick={() => testMutation.mutate(savedModelId)}
+            >
+              {testMutation.isPending ? (
+                <LoaderCircle size={14} className="spin" />
+              ) : (
+                <PlugZap size={14} />
+              )}
+              {t("testModel")}
+            </button>
+          ) : null}
         </div>
       ) : null}
       {error ? (
@@ -4219,23 +4728,12 @@ function ModelManager({
                 ) : null}
               </label>
               <label>
-                {t("credentialRef")}
-                <input
-                  {...form.register("credentialRef")}
-                  placeholder="OPENAI_API_KEY"
-                />
-                {fieldError("credentialRef") ? (
-                  <small className="form-error">
-                    {fieldError("credentialRef")}
-                  </small>
-                ) : null}
-              </label>
-              <label>
                 {t("apiKey")}
                 <input
                   {...form.register("apiKey")}
                   type="password"
                   autoComplete="new-password"
+                  placeholder="sk-..."
                 />
                 <small className="form-note">{t("apiKeyHint")}</small>
               </label>
@@ -4297,6 +4795,46 @@ function ModelManager({
   );
 }
 
+const knowledgeSettingsSchema = z
+  .object({
+    embeddingEnabled: z.boolean(),
+    embeddingModel: z.string().trim(),
+    embeddingBaseUrl: z.string().trim(),
+    embeddingCredentialEnv: z.string().trim(),
+    apiKey: z.string(),
+    vectorStore: z.string().trim(),
+    chunkSize: z.coerce.number().int().min(1).max(16_384),
+    chunkOverlap: z.coerce.number().int().min(0).max(8_192),
+  })
+  .superRefine((values, context) => {
+    if (!values.embeddingEnabled) return;
+    if (!values.embeddingModel) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["embeddingModel"] });
+    }
+    if (!/^https?:\/\//i.test(values.embeddingBaseUrl)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["embeddingBaseUrl"] });
+    }
+    if (!values.vectorStore) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["vectorStore"] });
+    }
+    if (values.chunkOverlap >= values.chunkSize) {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["chunkOverlap"] });
+    }
+  });
+
+type KnowledgeSettingsForm = z.infer<typeof knowledgeSettingsSchema>;
+
+const defaultKnowledgeSettingsForm: KnowledgeSettingsForm = {
+  embeddingEnabled: true,
+  embeddingModel: "",
+  embeddingBaseUrl: "",
+  embeddingCredentialEnv: "",
+  apiKey: "",
+  vectorStore: "local",
+  chunkSize: 800,
+  chunkOverlap: 120,
+};
+
 function KnowledgeManager({
   bases,
   query,
@@ -4318,7 +4856,43 @@ function KnowledgeManager({
     useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [descriptionDraft, setDescriptionDraft] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [settingsEditing, setSettingsEditing] = useState(false);
+  const [expandedDocumentId, setExpandedDocumentId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const settingsForm = useForm<KnowledgeSettingsForm>({
+    defaultValues: defaultKnowledgeSettingsForm,
+  });
+  const settingsQuery = useQuery({
+    queryKey: ["knowledge-settings"],
+    queryFn: studioApi.getKnowledgeSettings,
+    staleTime: 60_000,
+  });
+  const updateSettings = useMutation({
+    mutationFn: (values: KnowledgeSettingsForm) => {
+      const payload: KnowledgeSettingsUpdate = {
+        embeddingEnabled: values.embeddingEnabled,
+        embeddingModel: values.embeddingModel.trim(),
+        embeddingBaseUrl: values.embeddingBaseUrl.trim(),
+        embeddingCredentialEnv: values.embeddingCredentialEnv.trim() || undefined,
+        apiKey: values.apiKey.trim() || undefined,
+        vectorStore: values.vectorStore.trim(),
+        chunkSize: values.chunkSize,
+        chunkOverlap: values.chunkOverlap,
+      };
+      return studioApi.updateKnowledgeSettings(payload);
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["knowledge-settings"] });
+      setSettingsEditing(false);
+      setNotice(t("completed"));
+      setError("");
+    },
+    onError: (failure) => {
+      setError(failure instanceof Error && failure.message ? failure.message : t("knowledgeActionFailed"));
+    },
+  });
   const selectedBaseFromList = bases.find((base) => base.id === selectedId);
   const detailQuery = useQuery({
     queryKey: ["knowledge-base", selectedId],
@@ -4326,12 +4900,34 @@ function KnowledgeManager({
     enabled: Boolean(selectedId),
   });
   const selectedBase = detailQuery.data?.summary ?? selectedBaseFromList;
+  const statsQuery = useQuery({
+    queryKey: ["knowledge-stats", selectedId],
+    queryFn: () => studioApi.getKnowledgeStats(selectedId!),
+    enabled: Boolean(selectedId),
+  });
+  const chunksQuery = useQuery({
+    queryKey: ["knowledge-chunks", selectedId, expandedDocumentId],
+    queryFn: () => studioApi.listKnowledgeChunks(selectedId!, expandedDocumentId!),
+    enabled: Boolean(selectedId && expandedDocumentId),
+  });
+  const searchMutation = useMutation({
+    mutationFn: (query: string) =>
+      studioApi.searchKnowledge({
+        knowledgeBaseIds: [selectedId!],
+        query,
+        limit: 8,
+      }),
+    onSuccess: () => setError(""),
+    onError: (failure) =>
+      setError(failure instanceof Error && failure.message ? failure.message : t("knowledgeSearchFailed")),
+  });
   const refresh = async () => {
     await queryClient.refetchQueries({ queryKey: ["knowledge-bases"] });
     if (selectedId) {
       await queryClient.refetchQueries({
         queryKey: ["knowledge-base", selectedId],
       });
+      await queryClient.refetchQueries({ queryKey: ["knowledge-stats", selectedId] });
     }
   };
   const showSuccess = (duplicate = false) => {
@@ -4442,6 +5038,9 @@ function KnowledgeManager({
     setTextOpen(false);
     setEditingBase(false);
     setClearDocumentsConfirmation(false);
+    setSearchOpen(false);
+    setSearchText("");
+    setExpandedDocumentId(null);
     setNameDraft(base?.name ?? "");
     setDescriptionDraft(base?.description ?? "");
   };
@@ -4452,11 +5051,42 @@ function KnowledgeManager({
     setTextOpen(false);
     setEditingBase(false);
     setClearDocumentsConfirmation(false);
+    setSearchOpen(false);
+    setSearchText("");
+    setExpandedDocumentId(null);
   };
   const handleFiles = (files: File[]) => {
     if (files.length && selectedId) uploadFile.mutate(files);
   };
   const documents = detailQuery.data?.documents ?? [];
+  const selectedStats = statsQuery.data ?? {
+    knowledgeBaseId: selectedBase?.id ?? "",
+    documentCount: selectedBase?.documentCount ?? 0,
+    chunkCount: selectedBase?.chunkCount ?? 0,
+  };
+  const openSettingsEditor = () => {
+    const settings = settingsQuery.data;
+    settingsForm.reset({
+      embeddingEnabled: settings?.embeddingEnabled ?? true,
+      embeddingModel: settings?.embeddingModel ?? "",
+      embeddingBaseUrl: settings?.embeddingBaseUrl ?? "",
+      embeddingCredentialEnv: settings?.embeddingCredentialEnv ?? "",
+      apiKey: "",
+      vectorStore: settings?.vectorStore ?? defaultKnowledgeSettingsForm.vectorStore,
+      chunkSize: settings?.chunkSize ?? defaultKnowledgeSettingsForm.chunkSize,
+      chunkOverlap: settings?.chunkOverlap ?? defaultKnowledgeSettingsForm.chunkOverlap,
+    });
+    setSettingsEditing(true);
+    setError("");
+  };
+  const settingsSubmit = settingsForm.handleSubmit((values) => {
+    const parsed = knowledgeSettingsSchema.safeParse(values);
+    if (!parsed.success) {
+      setError(t("knowledgeActionFailed"));
+      return;
+    }
+    updateSettings.mutate(parsed.data);
+  });
 
   if (selectedBase)
     return (
@@ -4511,6 +5141,20 @@ function KnowledgeManager({
             </button>
             <button
               type="button"
+              className={
+                searchOpen ? "secondary-button is-active" : "secondary-button"
+              }
+              disabled={busy}
+              onClick={() => {
+                setSearchOpen((current) => !current);
+                setError("");
+              }}
+            >
+              <Search size={14} />
+              {t("testRetrieval")}
+            </button>
+            <button
+              type="button"
               className="secondary-button"
               disabled={busy}
               onClick={() => rebuildBase.mutate()}
@@ -4538,6 +5182,24 @@ function KnowledgeManager({
             </button>
           </div>
         </div>
+        <KnowledgeRuntimeSummary
+          settings={settingsQuery.data}
+          settingsLoading={settingsQuery.isLoading}
+          settingsError={settingsQuery.isError}
+          stats={selectedStats}
+          statsLoading={statsQuery.isLoading}
+          onConfigure={openSettingsEditor}
+          t={t}
+        />
+        {settingsEditing ? (
+          <KnowledgeSettingsEditor
+            form={settingsForm}
+            saving={updateSettings.isPending}
+            onCancel={() => setSettingsEditing(false)}
+            onSubmit={settingsSubmit}
+            t={t}
+          />
+        ) : null}
         {notice ? (
           <div className="manager-notice success">
             <CheckCircle2 size={14} />
@@ -4549,6 +5211,53 @@ function KnowledgeManager({
             <CircleAlert size={14} />
             {error}
           </div>
+        ) : null}
+        {searchOpen ? (
+          <form
+            className="inline-form knowledge-search-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (searchText.trim()) searchMutation.mutate(searchText.trim());
+            }}
+          >
+            <label>
+              {t("retrievalQuery")}
+              <input
+                value={searchText}
+                onChange={(event) => setSearchText(event.target.value)}
+                placeholder={t("retrievalQueryPlaceholder")}
+                autoFocus
+              />
+            </label>
+            <div className="inline-form-actions">
+              <span className="form-note">{t("retrievalQueryHint")}</span>
+              <button
+                type="submit"
+                className="primary-button"
+                disabled={!searchText.trim() || searchMutation.isPending}
+              >
+                {searchMutation.isPending ? (
+                  <LoaderCircle size={14} className="spin" />
+                ) : (
+                  <Search size={14} />
+                )}
+                {t("search")}
+              </button>
+            </div>
+            {searchMutation.data?.length ? (
+              <div className="knowledge-search-results">
+                {searchMutation.data.map((result) => (
+                  <KnowledgeSearchResultRow
+                    key={`${result.documentId}-${result.chunkIndex}`}
+                    result={result}
+                    t={t}
+                  />
+                ))}
+              </div>
+            ) : searchMutation.isSuccess ? (
+              <div className="manager-placeholder compact">{t("noKnowledgeSearchResults")}</div>
+            ) : null}
+          </form>
         ) : null}
         {editingBase ? (
           <form
@@ -4662,7 +5371,7 @@ function KnowledgeManager({
             <span>
               {detailQuery.isLoading
                 ? t("loading")
-                : `${documents.length} ${t("documentCount")}`}
+                : `${selectedStats.documentCount} ${t("documentCount")} · ${selectedStats.chunkCount} ${t("chunkCount")}`}
             </span>
           </div>
         </div>
@@ -4692,6 +5401,15 @@ function KnowledgeManager({
                 busy={busy}
                 onDelete={() => deleteDocument.mutate(document.id)}
                 onRebuild={() => rebuildDocument.mutate(document.id)}
+                chunksOpen={expandedDocumentId === document.id}
+                chunks={expandedDocumentId === document.id ? chunksQuery.data ?? [] : []}
+                chunksLoading={expandedDocumentId === document.id && chunksQuery.isLoading}
+                chunksError={expandedDocumentId === document.id && chunksQuery.isError}
+                onToggleChunks={() =>
+                  setExpandedDocumentId((current) =>
+                    current === document.id ? null : document.id,
+                  )
+                }
                 t={t}
               />
             ))}
@@ -4706,7 +5424,24 @@ function KnowledgeManager({
     );
 
   return (
-    <QueryResourceState query={query} t={t}>
+    <div className="knowledge-list-view">
+      <KnowledgeRuntimeSummary
+        settings={settingsQuery.data}
+        settingsLoading={settingsQuery.isLoading}
+        settingsError={settingsQuery.isError}
+        onConfigure={openSettingsEditor}
+        t={t}
+      />
+      {settingsEditing ? (
+        <KnowledgeSettingsEditor
+          form={settingsForm}
+          saving={updateSettings.isPending}
+          onCancel={() => setSettingsEditing(false)}
+          onSubmit={settingsSubmit}
+          t={t}
+        />
+      ) : null}
+      <QueryResourceState query={query} t={t}>
       {bases.map((base) => (
         <ResourceRow
           key={base.id}
@@ -4733,7 +5468,158 @@ function KnowledgeManager({
           }
         />
       ))}
-    </QueryResourceState>
+      </QueryResourceState>
+    </div>
+  );
+}
+
+function KnowledgeRuntimeSummary({
+  settings,
+  settingsLoading,
+  settingsError,
+  stats,
+  statsLoading,
+  onConfigure,
+  t,
+}: {
+  settings?: KnowledgeSettings;
+  settingsLoading: boolean;
+  settingsError: boolean;
+  stats?: { documentCount: number; chunkCount: number };
+  statsLoading?: boolean;
+  onConfigure?: () => void;
+  t: (key: string) => string;
+}) {
+  const embeddingReady = settings?.embeddingEnabled === true && settings.embeddingCredentialConfigured === true;
+  return (
+    <section className="knowledge-runtime-summary" aria-label={t("knowledgeRuntime") }>
+      <div className="knowledge-runtime-heading">
+        <div>
+          <strong>{t("knowledgeRuntime")}</strong>
+          <span>{t("knowledgeRuntimeHint")}</span>
+        </div>
+        <div className="knowledge-runtime-actions">
+          <span className={`knowledge-runtime-status ${embeddingReady ? "ready" : "warning"}`}>
+            {settingsLoading ? t("loading") : settingsError ? t("loadFailed") : embeddingReady ? t("embeddingReady") : t("embeddingNotConfigured")}
+          </span>
+          {onConfigure ? (
+            <button type="button" className="text-button" onClick={onConfigure} disabled={settingsLoading}>
+              <Pencil size={14} />
+              {t("configureEmbedding")}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      {settings ? (
+        <div className="knowledge-runtime-grid">
+          <div><span>{t("embeddingModel")}</span><strong>{settings.embeddingModel || "-"}</strong></div>
+          <div><span>{t("vectorStore")}</span><strong>{settings.vectorStore || "-"}</strong></div>
+          <div><span>{t("chunking")}</span><strong>{settings.chunkSize} / {settings.chunkOverlap}</strong></div>
+          <div><span>{t("embeddingEndpoint")}</span><strong>{settings.embeddingBaseUrl || "-"}</strong></div>
+          <div><span>{t("credentialVariable")}</span><strong>{settings.embeddingCredentialEnv || "-"}</strong></div>
+          {stats ? <div><span>{t("knowledgeStats")}</span><strong>{statsLoading ? t("loading") : `${stats.documentCount} ${t("documentCount")} · ${stats.chunkCount} ${t("chunkCount")}`}</strong></div> : null}
+        </div>
+      ) : settingsLoading ? (
+        <div className="manager-placeholder compact"><LoaderCircle size={15} className="spin" />{t("loading")}</div>
+      ) : null}
+    </section>
+  );
+}
+
+function KnowledgeSettingsEditor({
+  form,
+  saving,
+  onCancel,
+  onSubmit,
+  t,
+}: {
+  form: ReturnType<typeof useForm<KnowledgeSettingsForm>>;
+  saving: boolean;
+  onCancel: () => void;
+  onSubmit: () => void;
+  t: (key: string) => string;
+}) {
+  const embeddingEnabled = form.watch("embeddingEnabled");
+  const fieldError = (field: keyof KnowledgeSettingsForm) =>
+    form.formState.errors[field] ? t("loadFailed") : null;
+  return (
+    <form
+      className="inline-form knowledge-settings-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSubmit();
+      }}
+    >
+      <div className="knowledge-settings-heading">
+        <div>
+          <strong>{t("configureEmbedding")}</strong>
+          <span>{t("knowledgeRuntimeHint")}</span>
+        </div>
+        <label className="model-enabled-check">
+          <input type="checkbox" {...form.register("embeddingEnabled")} />
+          {embeddingEnabled ? t("enabled") : t("disabled")}
+        </label>
+      </div>
+      <div className="model-form-grid">
+        <label>
+          {t("embeddingModel")}
+          <input {...form.register("embeddingModel")} disabled={!embeddingEnabled} placeholder="text-embedding-3-small" />
+          {fieldError("embeddingModel") ? <small className="form-error">{fieldError("embeddingModel")}</small> : null}
+        </label>
+        <label>
+          {t("embeddingEndpoint")}
+          <input {...form.register("embeddingBaseUrl")} disabled={!embeddingEnabled} placeholder="https://api.openai.com/v1" />
+          {fieldError("embeddingBaseUrl") ? <small className="form-error">{fieldError("embeddingBaseUrl")}</small> : null}
+        </label>
+        <label>
+          {t("apiKey")}
+          <input {...form.register("apiKey")} type="password" autoComplete="new-password" disabled={!embeddingEnabled} placeholder="sk-..." />
+          <small className="form-note">{t("embeddingApiKeyHint")}</small>
+        </label>
+        <label>
+          {t("credentialVariable")}
+          <input {...form.register("embeddingCredentialEnv")} disabled={!embeddingEnabled} placeholder="OPENAI_API_KEY" />
+        </label>
+        <label>
+          {t("vectorStore")}
+          <input {...form.register("vectorStore")} disabled={!embeddingEnabled} placeholder="local" />
+          {fieldError("vectorStore") ? <small className="form-error">{fieldError("vectorStore")}</small> : null}
+        </label>
+        <label>
+          {t("chunking")}
+          <span className="knowledge-chunk-inputs">
+            <span><small>{t("chunkSize")}</small><input type="number" min="1" {...form.register("chunkSize", { valueAsNumber: true })} disabled={!embeddingEnabled} aria-label={t("chunkSize")} /></span>
+            <span><small>{t("chunkOverlap")}</small><input type="number" min="0" {...form.register("chunkOverlap", { valueAsNumber: true })} disabled={!embeddingEnabled} aria-label={t("chunkOverlap")} /></span>
+          </span>
+          {fieldError("chunkSize") || fieldError("chunkOverlap") ? <small className="form-error">{t("loadFailed")}</small> : null}
+        </label>
+      </div>
+      <div className="inline-form-actions">
+        <button type="button" className="secondary-button" disabled={saving} onClick={onCancel}>{t("cancel")}</button>
+        <button type="submit" className="primary-button" disabled={saving}>
+          {saving ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
+          {t("save")}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function KnowledgeSearchResultRow({
+  result,
+  t,
+}: {
+  result: KnowledgeSearchResult;
+  t: (key: string) => string;
+}) {
+  return (
+    <div className="knowledge-search-result">
+      <div>
+        <strong>{result.sourceName} · {t("chunkCount")} {result.chunkIndex + 1}</strong>
+        <span>{t("retrievalScore")}: {Number.isFinite(result.score) ? result.score.toFixed(3) : "-"}</span>
+      </div>
+      <p>{result.content}</p>
+    </div>
   );
 }
 
@@ -4742,12 +5628,22 @@ function KnowledgeDocumentRow({
   busy,
   onDelete,
   onRebuild,
+  chunksOpen,
+  chunks,
+  chunksLoading,
+  chunksError,
+  onToggleChunks,
   t,
 }: {
   document: KnowledgeDocument;
   busy: boolean;
   onDelete: () => void;
   onRebuild: () => void;
+  chunksOpen: boolean;
+  chunks: KnowledgeChunk[];
+  chunksLoading: boolean;
+  chunksError: boolean;
+  onToggleChunks: () => void;
   t: (key: string) => string;
 }) {
   const indexStatus = document.indexStatus ?? "READY";
@@ -4758,7 +5654,8 @@ function KnowledgeDocumentRow({
         ? t("indexing")
         : t("indexReady");
   return (
-    <div className="knowledge-document-row">
+    <div className="knowledge-document-shell">
+      <div className="knowledge-document-row">
       <div className="model-glyph">
         <FileText size={15} />
       </div>
@@ -4785,6 +5682,9 @@ function KnowledgeDocumentRow({
         ) : null}
       </div>
       <div className="row-actions">
+        <IconButton label={chunksOpen ? t("hideChunks") : t("viewChunks")} onClick={onToggleChunks}>
+          {chunksOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </IconButton>
         {document.rebuildable ? (
           <IconButton label={t("rebuildIndex")} onClick={onRebuild}>
             {busy ? (
@@ -4801,6 +5701,31 @@ function KnowledgeDocumentRow({
           onConfirm={onDelete}
         />
       </div>
+      </div>
+      {chunksOpen ? (
+        <div className="knowledge-chunk-list">
+        {chunksLoading ? (
+          <div className="manager-placeholder compact">
+            <LoaderCircle size={15} className="spin" />
+            <span>{t("loading")}</span>
+          </div>
+        ) : chunksError ? (
+          <div className="manager-placeholder compact">
+            <CircleAlert size={15} />
+            <span>{t("chunksLoadFailed")}</span>
+          </div>
+        ) : chunks.length ? (
+          chunks.map((chunk) => (
+            <div className="knowledge-chunk" key={chunk.id}>
+              <span>#{chunk.chunkIndex + 1}</span>
+              <p>{chunk.content}</p>
+            </div>
+          ))
+        ) : (
+          <div className="manager-placeholder compact">{t("noChunks")}</div>
+        )}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -4858,6 +5783,7 @@ function RepositorySearch({
   pending,
   source,
   onSourceChange,
+  includeSkillHub = false,
   includeClawHub = false,
   t,
 }: {
@@ -4867,6 +5793,7 @@ function RepositorySearch({
   pending: boolean;
   source: string;
   onSourceChange: (source: string) => void;
+  includeSkillHub?: boolean;
   includeClawHub?: boolean;
   t: (key: string) => string;
 }) {
@@ -4891,6 +5818,7 @@ function RepositorySearch({
         onChange={(event) => onSourceChange(event.target.value)}
         aria-label={t("searchSource")}
       >
+        {includeSkillHub ? <option value="skillhub">{t("searchSkillHub")}</option> : null}
         <option value="all">{t("searchAllSources")}</option>
         <option value="curated">{t("searchCurated")}</option>
         <option value="github">{t("searchGithub")}</option>
@@ -4979,17 +5907,46 @@ function SkillsManager({
   const queryClient = useQueryClient();
   const [section, setSection] = useState("installed");
   const [search, setSearch] = useState("");
-  const [searchSource, setSearchSource] = useState("all");
+  const [searchSource, setSearchSource] = useState("skillhub");
   const [visibleCount, setVisibleCount] = useState(30);
   const [selectedRepo, setSelectedRepo] = useState<SkillRepository | null>(
     null,
   );
+  const [editorFor, setEditorFor] = useState<Skill | null | undefined>(undefined);
+  const [editorId, setEditorId] = useState("");
+  const [editorMarkdown, setEditorMarkdown] = useState("");
+  const [editorEnabled, setEditorEnabled] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
   const [notice, setNotice] = useState("");
+  const detailQuery = useQuery({
+    queryKey: ["skill-detail", editorFor?.id],
+    queryFn: () => studioApi.getSkill(editorFor?.id ?? ""),
+    enabled: editorFor?.id !== undefined,
+  });
   const curatedQuery = useQuery({
     queryKey: ["skill-repositories"],
     queryFn: studioApi.listSkillRepositories,
     enabled: section === "marketplace",
+  });
+  const skillHubRepository = curatedQuery.data?.find(
+    (repository) => repository.id === "ethanyoq-skill-hub",
+  );
+  const skillHubQuery = useQuery({
+    queryKey: [
+      "skillhub-skills",
+      skillHubRepository?.url,
+      skillHubRepository?.defaultBranch,
+    ],
+    queryFn: () =>
+      studioApi.discoverRepositorySkills({
+        repoUrl: skillHubRepository?.url ?? "",
+        ref: skillHubRepository?.defaultBranch,
+        limit: 100,
+      }),
+    enabled:
+      section === "marketplace" &&
+      searchSource === "skillhub" &&
+      Boolean(skillHubRepository),
   });
   const searchMutation = useMutation({
     mutationFn: studioApi.searchSkillRepositories,
@@ -5017,6 +5974,12 @@ function SkillsManager({
       setNotice(t("completed"));
     },
   });
+  const installingRepositorySkillId = installMutation.isPending
+    ? installMutation.variables?.id
+    : undefined;
+  const installingClawHubReference = installClawHubMutation.isPending
+    ? installClawHubMutation.variables?.reference
+    : undefined;
   const deleteMutation = useMutation({
     mutationFn: studioApi.deleteSkill,
     onSuccess: () => {
@@ -5025,11 +5988,43 @@ function SkillsManager({
       setNotice(t("completed"));
     },
   });
+  const createMutation = useMutation({
+    mutationFn: studioApi.createSkill,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      setEditorFor(undefined);
+      setNotice(t("skillSaved"));
+    },
+  });
+  const updateMutation = useMutation({
+    mutationFn: ({ id, skillMarkdown, enabled }: { id: string; skillMarkdown: string; enabled: boolean }) =>
+      studioApi.updateSkillContent(id, { skillMarkdown, enabled }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      queryClient.invalidateQueries({ queryKey: ["skill-detail"] });
+      setEditorFor(undefined);
+      setNotice(t("skillSaved"));
+    },
+  });
+  useEffect(() => {
+    if (editorFor && detailQuery.data?.summary.id === editorFor.id) {
+      setEditorId(editorFor.id);
+      setEditorMarkdown(detailQuery.data.skillMarkdown);
+      setEditorEnabled(detailQuery.data.summary.enabled);
+    }
+  }, [detailQuery.data, editorFor]);
   const repositories = (searchMutation.data ?? curatedQuery.data ?? []).filter((repo) => {
     if (searchSource === "curated") return repo.sourceType === "CURATED";
     if (searchSource === "github") return repo.sourceType !== "CURATED";
     return true;
   });
+  const normalizedSkillHubSearch = search.trim().toLocaleLowerCase();
+  const skillHubSkills = (skillHubQuery.data ?? []).filter((skill) =>
+    !normalizedSkillHubSearch ||
+    `${skill.name} ${skill.description}`
+      .toLocaleLowerCase()
+      .includes(normalizedSkillHubSearch),
+  );
   const visibleRepositories = repositories.slice(0, visibleCount);
   const discover = (repository: SkillRepository) => {
     setSelectedRepo(repository);
@@ -5069,6 +6064,81 @@ function SkillsManager({
       ) : null}
       {section === "installed" ? (
         <QueryResourceState query={query} t={t}>
+          <div className="manager-toolbar">
+            <div>
+              <strong>{t("installedSkills")}</strong>
+              <small>{t("skillsHint")}</small>
+            </div>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => {
+                setEditorFor(null);
+                setEditorId("");
+                setEditorMarkdown("---\nname: \ndescription: \n---\n# New Skill\n\n");
+                setEditorEnabled(true);
+                setNotice("");
+              }}
+            >
+              <Plus size={14} />
+              {t("newSkill")}
+            </button>
+          </div>
+          {editorFor !== undefined ? (
+            <form
+              className="skill-editor"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!editorId.trim() || !editorMarkdown.trim()) return;
+                if (editorFor) {
+                  updateMutation.mutate({
+                    id: editorFor.id,
+                    skillMarkdown: editorMarkdown,
+                    enabled: editorEnabled,
+                  });
+                } else {
+                  createMutation.mutate({
+                    id: editorId.trim(),
+                    skillMarkdown: editorMarkdown,
+                    enabled: editorEnabled,
+                    overwrite: false,
+                  });
+                }
+              }}
+            >
+              <div className="skill-editor-heading">
+                <div>
+                  <strong>{editorFor ? t("editSkill") : t("newSkill")}</strong>
+                  {editorFor && detailQuery.isLoading ? <small>{t("loading")}</small> : null}
+                </div>
+                <button type="button" className="icon-button" onClick={() => setEditorFor(undefined)} aria-label={t("close")} title={t("close")}>
+                  <X size={15} />
+                </button>
+              </div>
+              <label>
+                {t("skillId")}
+                <input value={editorId} onChange={(event) => setEditorId(event.target.value)} readOnly={Boolean(editorFor)} required />
+              </label>
+              <label>
+                {t("skillMarkdown")}
+                <textarea value={editorMarkdown} onChange={(event) => setEditorMarkdown(event.target.value)} rows={14} required />
+              </label>
+              <label className="checkbox-row">
+                <input type="checkbox" checked={editorEnabled} onChange={(event) => setEditorEnabled(event.target.checked)} />
+                {t("enabled")}
+              </label>
+              {(createMutation.error || updateMutation.error) ? (
+                <div className="manager-notice error"><CircleAlert size={14} />{(createMutation.error || updateMutation.error) instanceof Error ? (createMutation.error || updateMutation.error)?.message : t("skillSaveFailed")}</div>
+              ) : null}
+              <div className="inline-form-actions">
+                <button type="button" className="secondary-button" onClick={() => setEditorFor(undefined)}>{t("cancel")}</button>
+                <button type="submit" className="primary-button" disabled={createMutation.isPending || updateMutation.isPending || (Boolean(editorFor) && detailQuery.isLoading)}>
+                  {(createMutation.isPending || updateMutation.isPending) ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
+                  {t("save")}
+                </button>
+              </div>
+            </form>
+          ) : null}
           {installed.map((skill) => (
             <ResourceRow
               key={skill.id}
@@ -5083,6 +6153,15 @@ function SkillsManager({
                     onChange={(enabled) => onToggle({ id: skill.id, enabled })}
                     label={skill.enabled ? t("disable") : t("enable")}
                   />
+                  <button type="button" className="text-button" onClick={() => {
+                    setEditorFor(skill);
+                    setEditorId(skill.id);
+                    setEditorMarkdown("");
+                    setEditorEnabled(skill.enabled);
+                    setNotice("");
+                  }}>
+                    <Pencil size={14} /> {t("editSkill")}
+                  </button>
                   <button
                     type="button"
                     className="text-button danger-text-button"
@@ -5100,8 +6179,12 @@ function SkillsManager({
           <RepositorySearch
             value={search}
             onChange={setSearch}
-            pending={searchMutation.isPending}
+            pending={
+              searchMutation.isPending ||
+              (searchSource === "skillhub" && skillHubQuery.isFetching)
+            }
             source={searchSource}
+            includeSkillHub
             includeClawHub
             onSourceChange={(src) => {
               setSearchSource(src);
@@ -5109,7 +6192,9 @@ function SkillsManager({
             }}
             onSubmit={() => {
               setNotice("");
-              if (searchSource === "clawhub") {
+              if (searchSource === "skillhub") {
+                void skillHubQuery.refetch();
+              } else if (searchSource === "clawhub") {
                 void clawHubQuery.refetch();
               } else {
                 searchMutation.mutate({
@@ -5120,13 +6205,50 @@ function SkillsManager({
             }}
             t={t}
           />
-          {searchSource === "clawhub" ? (
+          {searchSource === "skillhub" ? (
+            skillHubRepository ? (
+              <SkillDiscovery
+                repository={skillHubRepository}
+                query={{
+                  data: skillHubSkills,
+                  isPending: skillHubQuery.isLoading || skillHubQuery.isFetching,
+                  isError: skillHubQuery.isError,
+                }}
+                installed={installed}
+                installing={installMutation.isPending}
+                installingSkillId={installingRepositorySkillId}
+                installError={installMutation.error}
+                onBack={() => setSearchSource("all")}
+                onInstall={(skill) =>
+                  installMutation.mutate({
+                    repoUrl: skill.repositoryUrl,
+                    ref: skill.ref,
+                    path: skill.path || undefined,
+                    id: skill.installId,
+                    enabled: true,
+                    overwrite: false,
+                  })
+                }
+                t={t}
+              />
+            ) : (
+              <RepositoryResults
+                repositories={[]}
+                loading={curatedQuery.isLoading}
+                error={curatedQuery.isError}
+                onRetry={() => void curatedQuery.refetch()}
+                actionLabel={t("viewSkills")}
+                t={t}
+              />
+            )
+          ) : searchSource === "clawhub" ? (
             <ClawHubSkillResults
               skills={clawHubQuery.data ?? []}
               loading={clawHubQuery.isLoading || clawHubQuery.isFetching}
               error={clawHubQuery.error}
               installed={installed}
               installing={installClawHubMutation.isPending}
+              installingReference={installingClawHubReference}
               installError={installClawHubMutation.error}
               onRetry={() => void clawHubQuery.refetch()}
               onInstall={(skill) => installClawHubMutation.mutate({ reference: skill.reference, enabled: true, overwrite: false })}
@@ -5138,6 +6260,8 @@ function SkillsManager({
               query={discoverMutation}
               installed={installed}
               installing={installMutation.isPending}
+              installingSkillId={installingRepositorySkillId}
+              installError={installMutation.error}
               onBack={() => {
                 setSelectedRepo(null);
                 discoverMutation.reset();
@@ -5246,6 +6370,7 @@ function ClawHubSkillResults({
   error,
   installed,
   installing,
+  installingReference,
   installError,
   onRetry,
   onInstall,
@@ -5256,6 +6381,7 @@ function ClawHubSkillResults({
   error: unknown;
   installed: Skill[];
   installing: boolean;
+  installingReference?: string;
   installError: unknown;
   onRetry: () => void;
   onInstall: (skill: ClawHubSkill) => void;
@@ -5269,6 +6395,7 @@ function ClawHubSkillResults({
       {installError ? <div className="manager-notice error"><CircleAlert size={14} />{installError instanceof Error ? installError.message : t("installFailed")}</div> : null}
       {skills.map((skill) => {
         const isInstalled = installedSources.has(`clawhub/${skill.reference}`);
+        const isInstalling = installingReference === skill.reference;
         return <div className="repository-row" key={skill.id}>
           <div className="repository-main">
             <div className="repository-title"><strong>{skill.name}</strong>{skill.official ? <span className="repository-stars">{t("official")}</span> : null}</div>
@@ -5278,7 +6405,7 @@ function ClawHubSkillResults({
           <div className="repository-actions">
             <a className="icon-button" href={skill.url} target="_blank" rel="noreferrer" aria-label={t("openRepository")} title={t("openRepository")}><ExternalLink size={15} /></a>
             <button type="button" className={isInstalled ? "secondary-button" : "primary-button"} disabled={isInstalled || installing || skill.suspicious} onClick={() => onInstall(skill)}>
-              {installing ? <LoaderCircle size={14} className="spin" /> : <Package size={14} />}{isInstalled ? t("installed") : skill.suspicious ? t("reviewRequired") : t("install")}
+              {isInstalling ? <LoaderCircle size={14} className="spin" /> : <Package size={14} />}{isInstalled ? t("installed") : skill.suspicious ? t("reviewRequired") : t("install")}
             </button>
           </div>
         </div>;
@@ -5292,6 +6419,8 @@ function SkillDiscovery({
   query,
   installed,
   installing,
+  installingSkillId,
+  installError,
   onBack,
   onInstall,
   t,
@@ -5300,6 +6429,8 @@ function SkillDiscovery({
   query: { data?: RepositorySkill[]; isPending: boolean; isError: boolean };
   installed: Skill[];
   installing: boolean;
+  installingSkillId?: string;
+  installError: unknown;
   onBack: () => void;
   onInstall: (skill: RepositorySkill) => void;
   t: (key: string) => string;
@@ -5329,6 +6460,14 @@ function SkillDiscovery({
           {t("openRepository")}
         </a>
       </div>
+      {installError ? (
+        <div className="manager-notice error" role="alert">
+          <CircleAlert size={14} />
+          {installError instanceof Error && installError.message
+            ? installError.message
+            : t("installFailed")}
+        </div>
+      ) : null}
       {query.isPending ? (
         <div className="manager-placeholder">
           <LoaderCircle size={18} className="spin" />
@@ -5343,6 +6482,7 @@ function SkillDiscovery({
         <div className="skill-candidate-list">
           {query.data.map((skill) => {
             const isInstalled = installedIds.has(skill.installId);
+            const isInstalling = installingSkillId === skill.installId;
             return (
               <div
                 className="skill-candidate"
@@ -5366,7 +6506,7 @@ function SkillDiscovery({
                       <Check size={14} />
                       {t("installed")}
                     </>
-                  ) : installing ? (
+                  ) : isInstalling ? (
                     <LoaderCircle size={14} className="spin" />
                   ) : (
                     <>
@@ -5440,12 +6580,18 @@ function McpManager({
   query,
   onToggle,
   onRefresh,
+  refreshing,
+  refreshingId,
+  refreshError,
   t,
 }: {
   connections: McpConnection[];
   query: ResourceQuery;
   onToggle: (item: { id: string; enabled: boolean }) => void;
   onRefresh: (id: string) => void;
+  refreshing: boolean;
+  refreshingId?: string;
+  refreshError: unknown;
   t: (key: string) => string;
 }) {
   const queryClient = useQueryClient();
@@ -5455,6 +6601,9 @@ function McpManager({
   const [visibleRepositoryCount, setVisibleRepositoryCount] = useState(24);
   const [selectedRepo, setSelectedRepo] = useState<McpRepository | null>(null);
   const [notice, setNotice] = useState("");
+  const [verificationTargetId, setVerificationTargetId] = useState<string | null>(
+    null,
+  );
   const [editorFor, setEditorFor] = useState<McpConnection | null | undefined>(
     undefined,
   );
@@ -5487,10 +6636,27 @@ function McpManager({
             enabled: true,
             refreshTools: true,
           }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
+    onSuccess: async (connection) => {
+      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
       setSelectedRepo(null);
-      setNotice(t("completed"));
+      const toolsDiscovered = Boolean(connection.tools?.length);
+      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
+      setVerificationTargetId(toolsDiscovered ? null : connection.id);
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
+    },
+  });
+  const verifyInstallationMutation = useMutation({
+    mutationFn: studioApi.refreshMcpTools,
+    onSuccess: async (connection) => {
+      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
+      const toolsDiscovered = Boolean(connection.tools?.length);
+      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
+      setVerificationTargetId(toolsDiscovered ? null : connection.id);
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
     },
   });
   const saveMutation = useMutation({
@@ -5517,10 +6683,12 @@ function McpManager({
         ? studioApi.updateMcpConnection(target.id, payload)
         : studioApi.createMcpConnection(payload);
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
+    onSuccess: async (connection) => {
+      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
       setEditorFor(undefined);
-      setNotice(t("completed"));
+      const toolsDiscovered = Boolean(connection.tools?.length);
+      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
+      setVerificationTargetId(toolsDiscovered ? null : connection.id);
     },
   });
   const deleteMutation = useMutation({
@@ -5736,6 +6904,7 @@ function McpManager({
           setSection(next);
           setSelectedRepo(null);
           setNotice("");
+          setVerificationTargetId(null);
         }}
         t={t}
       />
@@ -5743,6 +6912,40 @@ function McpManager({
         <div className="manager-notice success">
           <CheckCircle2 size={14} />
           {notice}
+          {verificationTargetId ? (
+            <button
+              type="button"
+              className="text-button model-save-notice-action"
+              disabled={verifyInstallationMutation.isPending || refreshing}
+              onClick={() =>
+                verifyInstallationMutation.mutate(verificationTargetId)
+              }
+            >
+              {verifyInstallationMutation.isPending ? (
+                <LoaderCircle size={14} className="spin" />
+              ) : (
+                <RefreshCw size={14} />
+              )}
+              {t("refreshTools")}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {verifyInstallationMutation.isError ? (
+        <div className="manager-notice error" role="alert">
+          <CircleAlert size={14} />
+          {verifyInstallationMutation.error instanceof Error &&
+          verifyInstallationMutation.error.message
+            ? verifyInstallationMutation.error.message
+            : t("loadFailed")}
+        </div>
+      ) : null}
+      {refreshError ? (
+        <div className="manager-notice error" role="alert">
+          <CircleAlert size={14} />
+          {refreshError instanceof Error && refreshError.message
+            ? refreshError.message
+            : t("loadFailed")}
         </div>
       ) : null}
       {section === "installed" ? (
@@ -5769,12 +6972,21 @@ function McpManager({
                 icon={<Globe2 size={15} />}
                 title={connection.name}
                 detail={
-                  displayMcpDescription(
-                    connection.description,
-                    t("mcpDescriptionUnavailable"),
-                  )
+                  [
+                    displayMcpDescription(
+                      connection.description,
+                      t("mcpDescriptionUnavailable"),
+                    ),
+                    connection.lastError,
+                  ]
+                    .filter(Boolean)
+                    .join(" - ")
                 }
-                status={statusLabel(connection.status, t)}
+                status={
+                  connection.enabled
+                    ? `${t("enabled")} 路 ${statusLabel(connection.status, t)}`
+                    : t("disabled")
+                }
                 trailing={
                   <span className="row-actions">
                     <button
@@ -5786,9 +6998,14 @@ function McpManager({
                     </button>
                     <IconButton
                       label={t("refreshTools")}
+                      disabled={refreshing}
                       onClick={() => onRefresh(connection.id)}
                     >
-                      <RefreshCw size={14} />
+                      {refreshing && refreshingId === connection.id ? (
+                        <LoaderCircle size={14} className="spin" />
+                      ) : (
+                        <RefreshCw size={14} />
+                      )}
                     </IconButton>
                     <ToggleButton
                       checked={connection.enabled}

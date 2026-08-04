@@ -6,6 +6,7 @@ services:
     container_name: spring-agent-studio-web
     ports:
       - "5173:5173"
+      - "5174:5173"
       # The backend shares this network namespace. Expose it only to the host
       # so the local node client can use the same API as the browser.
       - "127.0.0.1:8083:8080"
@@ -32,10 +33,22 @@ services:
       dockerfile: Dockerfile.dev
     container_name: spring-agent-studio-backend
     environment:
-      SERVER_ADDRESS: 127.0.0.1
+      # Docker port forwarding enters the shared namespace via its container
+      # interface. The published 8083 port is host-loopback-only; the explicit
+      # flag below is required by the backend's LOCAL-mode safety gate.
+      SERVER_ADDRESS: 0.0.0.0
       PORT: 8080
       APP_SECURITY_MODE: LOCAL
-      APP_DATA_DIR: /workspace/data
+      APP_SECURITY_ALLOW_LOCAL_PROXY: "true"
+      # This shared interactive backend must remain personal-local. Dedicated
+      # evaluation deployments opt in explicitly in their own compose file.
+      APP_EXECUTION_ALLOW_NODES_ONLY: "false"
+      # Enable browser-based verification of this host's locally served development apps.
+      # Production keeps the backend default of rejecting all private browser targets.
+      APP_NODES_BROWSER_ALLOWED_PRIVATE_HOSTS: "127.0.0.1,localhost"
+      # Keep the container's development state isolated from a host-side backend.
+      # H2 file databases are single-writer; sharing /workspace/data can corrupt it.
+      APP_DATA_DIR: /workspace/.runtime-data
       SEARXNG_ENDPOINT: http://searxng:8080
       EDGEFN_API_KEY: ${EDGEFN_API_KEY:-}
       GRADLE_USER_HOME: /home/gradle/.gradle

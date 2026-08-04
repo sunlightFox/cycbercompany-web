@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { Agent, ModelProfile, StudioMessage } from '../types'
 
 type Theme = 'light' | 'dark'
+type MessageUpdate = StudioMessage[] | ((messages: StudioMessage[]) => StudioMessage[])
 
 type StudioState = {
   theme: Theme
@@ -21,13 +22,14 @@ type StudioState = {
   setSourceCitationId: (id: string | null) => void
   setSelectedAgentId: (id: string) => void
   setConversationId: (id: string | null) => void
-  setMessages: (messages: StudioMessage[]) => void
+  setMessages: (messages: MessageUpdate) => void
   setAgents: (agents: Agent[]) => void
   setModels: (models: ModelProfile[]) => void
   setBackendAvailable: (available: boolean) => void
 }
 
 const storedTheme = localStorage.getItem('studio-theme')
+const storedConversationId = localStorage.getItem('studio-active-conversation')
 
 export const useStudioStore = create<StudioState>((set) => ({
   theme: storedTheme === 'dark' ? 'dark' : 'light',
@@ -35,7 +37,7 @@ export const useStudioStore = create<StudioState>((set) => ({
   settingsOpen: false,
   sourceCitationId: null,
   selectedAgentId: 'default-assistant',
-  conversationId: null,
+  conversationId: storedConversationId || null,
   messages: [],
   agents: [],
   models: [],
@@ -49,8 +51,14 @@ export const useStudioStore = create<StudioState>((set) => ({
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
   setSourceCitationId: (sourceCitationId) => set({ sourceCitationId }),
   setSelectedAgentId: (selectedAgentId) => set({ selectedAgentId }),
-  setConversationId: (conversationId) => set({ conversationId }),
-  setMessages: (messages) => set({ messages }),
+  setConversationId: (conversationId) => {
+    if (conversationId) localStorage.setItem('studio-active-conversation', conversationId)
+    else localStorage.removeItem('studio-active-conversation')
+    set({ conversationId })
+  },
+  setMessages: (update) => set((state) => ({
+    messages: typeof update === 'function' ? update(state.messages) : update,
+  })),
   setAgents: (agents) => set({ agents }),
   setModels: (models) => set({ models }),
   setBackendAvailable: (backendAvailable) => set({ backendAvailable }),

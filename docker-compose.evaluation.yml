@@ -1,0 +1,42 @@
+services:
+  backend-evaluation:
+    build:
+      context: ../spring-agent-studio-backend
+      dockerfile: Dockerfile.dev
+    container_name: spring-agent-studio-evaluation-backend
+    ports:
+      - "127.0.0.1:8084:8080"
+    environment:
+      SERVER_ADDRESS: 0.0.0.0
+      PORT: 8080
+      APP_SECURITY_MODE: LOCAL
+      APP_SECURITY_ALLOW_LOCAL_PROXY: "true"
+      # This service is deliberately separate from the interactive development
+      # backend. Only it may enter NODES_ONLY for disposable sandbox evaluations.
+      APP_EXECUTION_ALLOW_NODES_ONLY: "true"
+      APP_NODES_BROWSER_ALLOWED_PRIVATE_HOSTS: "127.0.0.1,localhost"
+      APP_DATA_DIR: /workspace/.runtime-evaluation-data
+      SEARXNG_ENDPOINT: http://searxng:8080
+      EDGEFN_API_KEY: ${EDGEFN_API_KEY:-}
+      GRADLE_USER_HOME: /home/gradle/.gradle
+    volumes:
+      - ../spring-agent-studio-backend:/workspace
+      - evaluation_backend_build:/workspace/build
+      - evaluation_backend_project_gradle:/workspace/.gradle
+      - evaluation_backend_gradle_cache:/home/gradle/.gradle
+    command: ["sh", "./gradlew", "bootRun", "--no-daemon"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 90s
+    depends_on:
+      searxng:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  evaluation_backend_build:
+  evaluation_backend_project_gradle:
+  evaluation_backend_gradle_cache:
