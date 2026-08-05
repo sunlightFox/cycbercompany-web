@@ -599,7 +599,6 @@ function App() {
     refetchInterval: 30_000,
   });
   const executionMode = executionSettingsQuery.data?.mode ?? "PERSONAL_LOCAL";
-  const exposesNodes = executionMode !== "PERSONAL_LOCAL";
   const reconnecting = agentsQuery.isFetching || modelsQuery.isFetching;
   const handleReconnect = useCallback(async () => {
     setComposerNotice(t("reconnecting"));
@@ -892,15 +891,14 @@ function App() {
     );
     if (
       capabilityState.nodeId &&
-      (!exposesNodes ||
-        (nodesQuery.isSuccess &&
-          (!selectedNode ||
-            selectedNode.kind === "MANAGED_LOCAL" ||
-            !selectedNode.enabled ||
-            selectedNode.status?.toUpperCase() !== "ONLINE")))
+      (nodesQuery.isSuccess &&
+        (!selectedNode ||
+          selectedNode.kind === "MANAGED_LOCAL" ||
+          !selectedNode.enabled ||
+          selectedNode.status?.toUpperCase() !== "ONLINE"))
     )
       setCapabilityState((current) => ({ ...current, nodeId: undefined }));
-  }, [capabilityState.nodeId, exposesNodes, nodesQuery.data, nodesQuery.isSuccess]);
+  }, [capabilityState.nodeId, nodesQuery.data, nodesQuery.isSuccess]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -2221,7 +2219,6 @@ function App() {
             skillsQuery={skillsQuery}
             mcpQuery={mcpQuery}
             nodesQuery={nodesQuery}
-            executionMode={executionMode}
             capabilityState={capabilityState}
             onCapabilityChange={handleCapabilityChange}
             approvalMode={approvalMode}
@@ -3239,7 +3236,6 @@ function Composer({
   skillsQuery,
   mcpQuery,
   nodesQuery,
-  executionMode,
   capabilityState,
   onCapabilityChange,
   approvalMode,
@@ -3270,7 +3266,6 @@ function Composer({
   skillsQuery: { data?: Skill[] };
   mcpQuery: { data?: McpConnection[] };
   nodesQuery: { data?: NodeConnection[] };
-  executionMode: ExecutionMode;
   capabilityState: CapabilityState;
   onCapabilityChange: (state: CapabilityState) => void;
   approvalMode: ApprovalMode;
@@ -3285,13 +3280,19 @@ function Composer({
     textarea.style.height = "0px";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
   }, [textareaRef, value]);
+  const registeredOnlineNodes = (nodesQuery.data ?? []).filter(
+    (node) =>
+      node.kind !== "MANAGED_LOCAL" &&
+      node.enabled &&
+      node.status?.toUpperCase() === "ONLINE",
+  );
 
   const totalCapabilities =
     capabilityState.knowledgeBaseIds.length +
     capabilityState.skillIds.length +
     capabilityState.mcpServerIds.length +
     capabilityState.toolNames.length +
-    (executionMode !== "PERSONAL_LOCAL" && capabilityState.nodeId ? 1 : 0);
+    (capabilityState.nodeId ? 1 : 0);
   const builtInTools = (toolsQuery.data ?? []).filter(
     (tool) => !isExternalToolName(tool.name),
   );
@@ -3308,11 +3309,9 @@ function Composer({
     ...(mcpQuery.data ?? [])
       .filter((connection) => capabilityState.mcpServerIds.includes(connection.id))
       .map((connection) => ({ id: connection.id, label: connection.name, kind: t("mcp"), key: "mcpServerIds" as const })),
-    ...(executionMode !== "PERSONAL_LOCAL"
-      ? (nodesQuery.data ?? [])
-          .filter((node) => node.id === capabilityState.nodeId)
-          .map((node) => ({ id: node.id, label: node.name, kind: t("nodes"), key: "nodeId" as const }))
-      : []),
+    ...registeredOnlineNodes
+      .filter((node) => node.id === capabilityState.nodeId)
+      .map((node) => ({ id: node.id, label: node.name, kind: t("nodes"), key: "nodeId" as const })),
   ];
   const removeCapability = (chip: (typeof selectedCapabilityChips)[number]) => {
     if (chip.key === "nodeId") {
@@ -3372,16 +3371,14 @@ function Composer({
                 <Zap size={12} />
                 <span className="selected-capability-kind">{chip.kind}</span>
                 <span>{chip.label}</span>
-                {chip.key !== "nodeId" || executionMode !== "NODES_ONLY" ? (
-                  <button
-                    type="button"
-                    aria-label={`${t("removeCapability")} ${chip.label}`}
-                    title={t("removeCapability")}
-                    onClick={() => removeCapability(chip)}
-                  >
-                    <X size={12} />
-                  </button>
-                ) : null}
+                <button
+                  type="button"
+                  aria-label={`${t("removeCapability")} ${chip.label}`}
+                  title={t("removeCapability")}
+                  onClick={() => removeCapability(chip)}
+                >
+                  <X size={12} />
+                </button>
               </span>
             ))}
           </div>
@@ -3457,17 +3454,7 @@ function Composer({
             knowledgeBases={knowledgeBasesQuery.data ?? []}
             skills={skillsQuery.data ?? []}
             mcpConnections={mcpQuery.data ?? []}
-            nodes={
-              executionMode !== "PERSONAL_LOCAL"
-                ? (nodesQuery.data ?? []).filter(
-                    (node) =>
-                      node.kind !== "MANAGED_LOCAL" &&
-                      node.enabled &&
-                      node.status?.toUpperCase() === "ONLINE",
-                  )
-                : []
-            }
-            executionMode={executionMode}
+            nodes={registeredOnlineNodes}
             state={capabilityState}
             onChange={onCapabilityChange}
             t={t}
@@ -3538,7 +3525,6 @@ function CapabilityMenu({
   skills,
   mcpConnections,
   nodes,
-  executionMode,
   state,
   onChange,
   t,
@@ -3552,7 +3538,6 @@ function CapabilityMenu({
   skills: Skill[];
   mcpConnections: McpConnection[];
   nodes: NodeConnection[];
-  executionMode: ExecutionMode;
   state: CapabilityState;
   onChange: (state: CapabilityState) => void;
   t: (key: string) => string;
@@ -3576,7 +3561,7 @@ function CapabilityMenu({
       skillIds: [],
       mcpServerIds: [],
       toolNames: [],
-      nodeId: executionMode === "NODES_ONLY" ? state.nodeId : undefined,
+      nodeId: undefined,
     });
   const matches = (label: string, detail: string) =>
     !query.trim() ||
@@ -3730,7 +3715,7 @@ function CapabilityMenu({
               onToggle={toggle}
             />
           ) : null}
-          {executionMode !== "PERSONAL_LOCAL" ? (
+          {nodes.length ? (
             <div className="capability-group">
               <div className="capability-group-title">
                 {t("executionTarget")}
@@ -3741,17 +3726,6 @@ function CapabilityMenu({
                   onChange({ ...state, nodeId: value || undefined })
                 }
               >
-                {executionMode === "LOCAL_AND_NODES" ? (
-                  <DropdownMenu.RadioItem value="" className="capability-item">
-                    <DropdownMenu.ItemIndicator className="item-indicator">
-                      <Check size={13} />
-                    </DropdownMenu.ItemIndicator>
-                    <span>
-                      <strong>{t("thisComputer")}</strong>
-                      <small>{t("thisComputerHint")}</small>
-                    </span>
-                  </DropdownMenu.RadioItem>
-                ) : null}
                 {nodes.map((node) => (
                   <DropdownMenu.RadioItem
                     key={node.id}
@@ -3779,7 +3753,6 @@ function CapabilityMenu({
           !knowledgeBases.length &&
           !skills.length &&
           !mcpConnections.length &&
-          executionMode === "PERSONAL_LOCAL" &&
           !nodes.length ? (
             <div className="capability-empty">
               <Wrench size={15} />
