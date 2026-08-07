@@ -1,19 +1,19 @@
-import { ArrowLeft, Check, CircleAlert, Copy, HardDrive, LoaderCircle, Pencil, PlugZap, RefreshCw, ShieldCheck, Trash2, Wrench } from "lucide-react";
-import { Children, type ReactNode, useState } from "react";
+import { ArrowLeft, Check, CircleAlert, Copy, Download, HardDrive, LoaderCircle, Pencil, Play, PlugZap, RefreshCw, ShieldCheck, Trash2, Unplug, Wrench } from "lucide-react";
+import { Children, type ReactNode, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { studioApi } from "../lib/api";
-import type { NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RotateNodeSecretResult } from "../types";
+import type { ExecutionMode, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RotateNodeSecretResult } from "../types";
 export default function NodeManager({
   nodes,
   nodesQuery,
   approvalsQuery,
-  managedLocalExecutorAvailable,
+  executionMode,
   t,
 }: {
   nodes: NodeConnection[];
   nodesQuery: ResourceQuery;
   approvalsQuery: ResourceQuery & { data?: NodeToolApproval[] };
-  managedLocalExecutorAvailable: boolean;
+  executionMode: ExecutionMode;
   t: (key: string) => string;
 }) {
   const queryClient = useQueryClient();
@@ -30,6 +30,8 @@ export default function NodeManager({
   const [rotatedCredentials, setRotatedCredentials] =
     useState<RotateNodeSecretResult | null>(null);
   const [copiedCredential, setCopiedCredential] = useState(false);
+  const personalLocal = executionMode === "PERSONAL_LOCAL";
+  const managedLocalExecutorAvailable = executionMode !== "NODES_ONLY";
   const managedLocalExecutor = nodes.find((node) => node.kind === "MANAGED_LOCAL");
   const detailsQuery = useQuery({
     queryKey: ["node", selectedId],
@@ -40,6 +42,13 @@ export default function NodeManager({
     queryKey: ["managed-local-executor", managedLocalExecutor?.id],
     queryFn: () => studioApi.getNode(managedLocalExecutor!.id),
     enabled: Boolean(managedLocalExecutor),
+  });
+  const localExecutorLauncherQuery = useQuery({
+    queryKey: ["local-executor-launcher"],
+    queryFn: studioApi.getLocalExecutorLauncherHealth,
+    enabled: managedLocalExecutorAvailable,
+    retry: 0,
+    refetchInterval: 10_000,
   });
   const registerNode = useMutation({
     mutationFn: () => studioApi.createNodeRegistrationToken(),
@@ -104,6 +113,29 @@ export default function NodeManager({
       queryClient.invalidateQueries({ queryKey: ["node", result.nodeId] });
     },
   });
+  const disconnectNode = useMutation({
+    mutationFn: studioApi.disconnectNode,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["nodes"] });
+      queryClient.invalidateQueries({ queryKey: ["node", result.id] });
+      queryClient.invalidateQueries({ queryKey: ["managed-local-executor", result.id] });
+    },
+  });
+  const startLocalExecutor = useMutation({
+    mutationFn: async (workspace: string) => {
+      await studioApi.startLocalExecutor(workspace);
+
+      // The launcher acknowledges before the Java process has registered and
+      // opened its WebSocket. Keep the button in its loading state and publish
+      // each observed node snapshot until the executor is genuinely usable.
+      const nextNodes = await studioApi.waitForManagedLocalExecutorOnline();
+      queryClient.setQueryData(["nodes"], nextNodes);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["nodes"] });
+      queryClient.invalidateQueries({ queryKey: ["local-executor-launcher"] });
+    },
+  });
   const decideApproval = useMutation({
     mutationFn: ({ id, approved }: { id: string; approved: boolean }) =>
       studioApi.decideNodeToolApproval(id, approved),
@@ -122,6 +154,8 @@ export default function NodeManager({
     .includes("system-access.v1");
   const systemAccessEnabled = systemTools.length > 0
     && systemTools.every((tool) => tool.enabled && !tool.requiresApproval);
+  const localExecutorLauncherChecking = localExecutorLauncherQuery.isPending && managedLocalExecutorAvailable;
+  const localExecutorLauncherAvailable = localExecutorLauncherQuery.data?.reachable ?? false;
   const setSystemAccess = (enabled: boolean) => {
     if (!selectedNode || !systemAccessAvailable || !systemTools.length) return;
     updateSystemAccess.mutate({ nodeId: selectedNode.id, enabled });
@@ -129,7 +163,7 @@ export default function NodeManager({
   const copyCommand = async () => {
     if (!registration) return;
     try {
-      await navigator.clipboard?.writeText(registration.usageHint);
+      await navigator.clipboard?.writeText(nodeRegistrationCommand(registration.registrationToken));
       setCopiedCommand(true);
     } catch {
       setCopiedCommand(false);
@@ -427,6 +461,39 @@ export default function NodeManager({
       </div>
     );
 
+  if (personalLocal)
+    return (
+      <div className="node-manager">
+        <ManagedLocalExecutorStatus
+          node={managedLocalExecutor}
+          details={localExecutorQuery.data}
+          toolsLoading={localExecutorQuery.isLoading}
+          updatingTools={updateTool.isPending}
+          disconnecting={disconnectNode.isPending}
+          starting={startLocalExecutor.isPending}
+          startError={startLocalExecutor.error instanceof Error ? startLocalExecutor.error.message : null}
+          available={managedLocalExecutorAvailable}
+          launcherChecking={localExecutorLauncherChecking}
+          launcherAvailable={localExecutorLauncherAvailable}
+          launcherWorkspace={localExecutorLauncherQuery.data?.workspace}
+          onDisconnect={() => {
+            if (!managedLocalExecutor) return;
+            disconnectNode.mutate(managedLocalExecutor.id);
+          }}
+          onUpdateTool={(toolName, payload) => {
+            if (!managedLocalExecutor) return;
+            updateTool.mutate({
+              nodeId: managedLocalExecutor.id,
+              toolName,
+              payload,
+            });
+          }}
+          onStart={(workspace) => startLocalExecutor.mutate(workspace)}
+          t={t}
+        />
+      </div>
+    );
+
   return (
     <div className="node-manager">
       <div className="manager-subtabs" role="tablist">
@@ -461,7 +528,17 @@ export default function NodeManager({
             details={localExecutorQuery.data}
             toolsLoading={localExecutorQuery.isLoading}
             updatingTools={updateTool.isPending}
+            disconnecting={disconnectNode.isPending}
+            starting={startLocalExecutor.isPending}
+            startError={startLocalExecutor.error instanceof Error ? startLocalExecutor.error.message : null}
             available={managedLocalExecutorAvailable}
+            launcherChecking={localExecutorLauncherChecking}
+            launcherAvailable={localExecutorLauncherAvailable}
+            launcherWorkspace={localExecutorLauncherQuery.data?.workspace}
+            onDisconnect={() => {
+              if (!managedLocalExecutor) return;
+              disconnectNode.mutate(managedLocalExecutor.id);
+            }}
             onUpdateTool={(toolName, payload) => {
               if (!managedLocalExecutor) return;
               updateTool.mutate({
@@ -470,6 +547,7 @@ export default function NodeManager({
                 payload,
               });
             }}
+            onStart={(workspace) => startLocalExecutor.mutate(workspace)}
             t={t}
           />
           <div className="node-onboarding">
@@ -497,7 +575,7 @@ export default function NodeManager({
                 <span>{t("nodeTokenExpires")}</span>
                 <strong>{formatTimestamp(registration.expiresAt)}</strong>
               </div>
-              <code>{registration.usageHint}</code>
+              <code>{nodeRegistrationCommand(registration.registrationToken)}</code>
               <button
                 className="secondary-button"
                 type="button"
@@ -576,7 +654,15 @@ function ManagedLocalExecutorStatus({
   details,
   toolsLoading,
   updatingTools,
+  disconnecting,
+  starting,
+  startError,
   available,
+  launcherChecking,
+  launcherAvailable,
+  launcherWorkspace,
+  onDisconnect,
+  onStart,
   onUpdateTool,
   t,
 }: {
@@ -584,7 +670,15 @@ function ManagedLocalExecutorStatus({
   details?: NodeDetail;
   toolsLoading: boolean;
   updatingTools: boolean;
+  disconnecting: boolean;
+  starting: boolean;
+  startError: string | null;
   available: boolean;
+  launcherChecking: boolean;
+  launcherAvailable: boolean;
+  launcherWorkspace?: string;
+  onDisconnect: () => void;
+  onStart: (workspace: string) => void;
   onUpdateTool: (toolName: string, payload: {
     enabled?: boolean;
     requiresApproval?: boolean;
@@ -593,6 +687,10 @@ function ManagedLocalExecutorStatus({
 }) {
   const [workspace, setWorkspace] = useState("");
   const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!launcherWorkspace?.trim()) return;
+    setWorkspace((current) => current.trim() ? current : launcherWorkspace);
+  }, [launcherWorkspace]);
   const online = Boolean(available && node?.enabled && node.status?.toUpperCase() === "ONLINE");
   const status = !available
     ? t("localExecutorUnavailable")
@@ -602,6 +700,8 @@ function ManagedLocalExecutorStatus({
       ? t("disabled")
       : statusLabel(node.status, t);
   const command = localExecutorStartCommand(workspace);
+  const companionDownloadUrl = windowsCompanionDownloadUrl();
+  const installerAvailable = Boolean(companionDownloadUrl && !launcherChecking && !launcherAvailable);
   const workspaceConfigured = Boolean(workspace.trim());
   const systemTools = (details?.tools ?? []).filter((tool) =>
     tool.name.startsWith("system."),
@@ -626,10 +726,23 @@ function ManagedLocalExecutorStatus({
             <strong>{t("localExecutor")}</strong>
             <p>{!available ? t("localExecutorUnavailableHint") : node ? t("localExecutorConnectedHint") : t("localExecutorHint")}</p>
           </div>
-          <span className="list-status">
-            <span className="status-dot" data-online={online} />
-            {status}
-          </span>
+          <div className="managed-local-executor-actions">
+            <span className="list-status">
+              <span className="status-dot" data-online={online} />
+              {status}
+            </span>
+            {online ? (
+              <button
+                className="secondary-button danger-button"
+                type="button"
+                disabled={disconnecting}
+                onClick={onDisconnect}
+              >
+                {disconnecting ? <LoaderCircle size={14} className="spin" /> : <Unplug size={14} />}
+                {t("disconnectNode")}
+              </button>
+            ) : null}
+          </div>
         </div>
         <div className="managed-local-executor-meta">
           <LocalExecutorMeta label={t("lastSeen")} value={node ? formatTimestamp(node.lastSeenAt) : "-"} />
@@ -665,9 +778,9 @@ function ManagedLocalExecutorStatus({
           <div className="local-executor-launch">
             <div>
               <strong>{t("localExecutorStartTitle")}</strong>
-              <p>{t("localExecutorStartHint")}</p>
+              <p>{launcherAvailable ? t("localExecutorOneClickHint") : installerAvailable ? t("localExecutorInstallHint") : t("localExecutorStartHint")}</p>
             </div>
-            <label>
+            {!installerAvailable ? <label>
               {t("localExecutorWorkspace")}
               <input
                 value={workspace}
@@ -677,8 +790,15 @@ function ManagedLocalExecutorStatus({
                 }}
                 placeholder={t("localExecutorWorkspacePlaceholder")}
               />
-            </label>
-            {workspaceConfigured ? (
+            </label> : null}
+            {installerAvailable && companionDownloadUrl ? (
+              <div className="local-executor-install-actions">
+                <a className="primary-button" href={companionDownloadUrl} download>
+                  <Download size={14} />
+                  {t("localExecutorDownloadWindows")}
+                </a>
+              </div>
+            ) : workspaceConfigured && !launcherChecking && !launcherAvailable ? (
               <div className="node-command local-executor-command">
                 <code>{command}</code>
                 <button
@@ -690,9 +810,46 @@ function ManagedLocalExecutorStatus({
                   {copied ? t("commandCopied") : t("localExecutorCopyStartCommand")}
                 </button>
               </div>
-            ) : (
+            ) : !workspaceConfigured ? (
               <p className="local-executor-workspace-hint">{t("localExecutorWorkspaceHint")}</p>
-            )}
+            ) : null}
+            {!installerAvailable && !launcherChecking && !launcherAvailable ? (
+              <p className="local-executor-start-error">
+                <CircleAlert size={14} />
+                {t("localExecutorLauncherUnavailable")}
+              </p>
+            ) : null}
+            {launcherChecking || launcherAvailable ? <div className="local-executor-launch-actions">
+              <button
+                className="primary-button"
+                type="button"
+                disabled={
+                  starting ||
+                  launcherChecking ||
+                  !launcherAvailable ||
+                  !workspaceConfigured
+                }
+                onClick={() => onStart(workspace)}
+                aria-busy={starting}
+              >
+                {starting ? <LoaderCircle size={14} className="spin" /> : <Play size={14} />}
+                {starting ? t("localExecutorStarting") : t("localExecutorStart")}
+              </button>
+            </div> : null}
+            {startError ? (
+              <div className="local-executor-start-error">
+                <CircleAlert size={14} />
+                <span>{startError}</span>
+                <button
+                  className="connection-retry"
+                  type="button"
+                  disabled={starting || !launcherAvailable || !workspaceConfigured}
+                  onClick={() => onStart(workspace)}
+                >
+                  {t("retry")}
+                </button>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -700,19 +857,52 @@ function ManagedLocalExecutorStatus({
   );
 }
 
+function windowsCompanionDownloadUrl() {
+  if (!navigator.userAgent.includes("Windows")) return null;
+  const configured = import.meta.env.VITE_WINDOWS_COMPANION_DOWNLOAD_URL;
+  if (typeof configured !== "string" || !configured.trim()) return null;
+  try {
+    const url = new URL(configured.trim(), window.location.origin);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 function localExecutorStartCommand(workspace: string) {
   const configuredServer = import.meta.env.VITE_NODE_SERVER_URL;
   const configuredApiRoot = import.meta.env.VITE_API_BASE_URL;
+  const developmentProxyTarget = import.meta.env.VITE_DEV_PROXY_TARGET;
   const server = typeof configuredServer === "string" && /^https?:\/\//i.test(configuredServer)
     ? configuredServer.replace(/\/+$/, "")
     : typeof configuredApiRoot === "string" && /^https?:\/\//i.test(configuredApiRoot)
     ? new URL(configuredApiRoot).origin
+    : import.meta.env.DEV && typeof developmentProxyTarget === "string" && /^https?:\/\//i.test(developmentProxyTarget)
+    ? developmentProxyTarget.replace(/\/+$/, "")
     : window.location.origin;
   const workspaceArgument = workspace.trim()
     ? ` --workspace "${workspace.trim().replaceAll('"', '\\"')}"`
     : "";
-  const argumentsValue = `start-local --server ${server}${workspaceArgument}`.replaceAll("'", "''");
-  return `.\\gradlew.bat :agent-studio-node-java:run '--args=${argumentsValue}'`;
+  const argumentsValue = `start-local --server ${server}${workspaceArgument}`;
+  if (navigator.userAgent.includes("Windows")) {
+    return `.\\gradlew.bat :agent-studio-node-java:run '--args=${argumentsValue.replaceAll("'", "''")}'`;
+  }
+  return `./gradlew :agent-studio-node-java:run --args='${argumentsValue.replaceAll("'", "'\\\"'\\\"'")}'`;
+}
+
+function nodeRegistrationCommand(token: string) {
+  const configuredApiRoot = import.meta.env.VITE_API_BASE_URL;
+  const server = typeof configuredApiRoot === "string" && /^https?:\/\//i.test(configuredApiRoot)
+    ? new URL(configuredApiRoot).origin
+    : window.location.origin;
+  const escapedToken = token.replaceAll("'", "'\\\"'\\\"'");
+  if (navigator.userAgent.includes("Windows")) {
+    const scriptUrl = `${server}/node-bootstrap.ps1`;
+    const escapedPowerShellToken = token.replaceAll("'", "''");
+    return `curl.exe -fsSL "${scriptUrl}" -o agent-studio-node-bootstrap.ps1; powershell -NoProfile -ExecutionPolicy Bypass -File .\\agent-studio-node-bootstrap.ps1 -Server "${server}" -Token '${escapedPowerShellToken}'`;
+  }
+  const scriptUrl = `${server}/node-bootstrap.sh`;
+  return `curl -fsSL '${scriptUrl}' -o agent-studio-node-bootstrap.sh && sh agent-studio-node-bootstrap.sh --server '${server}' --token '${escapedToken}'`;
 }
 
 function LocalExecutorMeta({ label, value }: { label: string; value: string }) {

@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type { Agent, ModelProfile, StudioMessage } from '../types'
 
-type Theme = 'light' | 'dark'
+export type Theme = 'light' | 'dark' | 'white'
 type MessageUpdate = StudioMessage[] | ((messages: StudioMessage[]) => StudioMessage[])
 
 type StudioState = {
@@ -32,7 +32,7 @@ const storedTheme = localStorage.getItem('studio-theme')
 const storedConversationId = localStorage.getItem('studio-active-conversation')
 
 export const useStudioStore = create<StudioState>((set) => ({
-  theme: storedTheme === 'dark' ? 'dark' : 'light',
+  theme: storedTheme === 'dark' || storedTheme === 'white' ? storedTheme : 'light',
   sidebarOpen: false,
   settingsOpen: false,
   sourceCitationId: null,

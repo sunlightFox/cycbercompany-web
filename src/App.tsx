@@ -5,9 +5,9 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import {
   ArrowLeft,
   ArrowUp,
+  Archive,
   Bot,
   Check,
-  CheckCircle2,
   ChevronDown,
   ChevronRight,
   CircleAlert,
@@ -15,7 +15,6 @@ import {
   Copy,
   Database,
   Download,
-  ExternalLink,
   FileText,
   FolderKanban,
   Globe2,
@@ -25,27 +24,25 @@ import {
   Menu,
   MoreHorizontal,
   Moon,
+  PanelLeftClose,
   Paperclip,
-  Package,
-  Pencil,
   Plus,
-  PlugZap,
   RefreshCw,
   RotateCcw,
   Search,
   Settings2,
+  Shield,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Sun,
   TerminalSquare,
   Trash2,
-  Upload,
   Wrench,
   X,
   Zap,
 } from "lucide-react";
 import {
-  Children,
   Fragment,
   lazy,
   Suspense,
@@ -59,41 +56,26 @@ import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
-import { RunLaunchTimeoutError, studioApi, streamRunEvents } from "./lib/api";
+import { RunLaunchTimeoutError, StudioApiError, studioApi, streamRunEvents } from "./lib/api";
 import { createUuid } from "./lib/uuid";
 import { useStudioStore } from "./store/useStudioStore";
-import { AgentManager } from "./components/AgentManager";
 import type {
   Agent,
   ApprovalMode,
   Artifact,
   Citation,
-  ClawHubSkill,
   ExecutionMode,
   ConversationAttachment,
   KnowledgeBase,
-  KnowledgeChunk,
-  KnowledgeDocument,
-  KnowledgeSearchResult,
-  KnowledgeSettings,
-  KnowledgeSettingsUpdate,
   McpConnection,
-  McpRepository,
-  McpTool,
-  McpToolInvocation,
   Message,
-  ModelCapability,
-  ModelPreset,
   ModelProfile,
-  ModelTestResult,
   NodeConnection,
-  RepositorySkill,
   RunEvent,
   RunView,
   RunStep,
   Skill,
   SkillPreflight,
-  SkillRepository,
   StudioMessage,
   Tool,
 } from "./types";
@@ -120,12 +102,27 @@ type CapabilityArrayKey =
   | "skillIds"
   | "mcpServerIds"
   | "toolNames";
-type HistoryEntry = { id: string; title: string; updatedAt: string };
+type HistoryEntry = {
+  id: string;
+  title: string;
+  updatedAt: string;
+  archived?: boolean;
+  archivedAt?: string | null;
+};
 
 const HISTORY_STORAGE_KEY = "studio-conversation-history";
 const CITATION_STORAGE_KEY = "studio-conversation-citations";
 const APPROVAL_MODE_STORAGE_KEY = "studio-conversation-approval-modes";
 const AssistantMarkdown = lazy(() => import("./components/AssistantMarkdown"));
+const AgentManager = lazy(() =>
+  import("./components/AgentManager").then(({ AgentManager }) => ({
+    default: AgentManager,
+  })),
+);
+const McpManager = lazy(() => import("./components/McpManager"));
+const SkillsManager = lazy(() => import("./components/SkillsManager"));
+const KnowledgeManager = lazy(() => import("./components/KnowledgeManager"));
+const ModelManager = lazy(() => import("./components/ModelManager"));
 const NodeManager = lazy(() => import("./components/NodeManager"));
 const CitationDrawer = lazy(() => import("./components/CitationDrawer"));
 const RunAuditDrawer = lazy(() => import("./components/RunAuditDrawer"));
@@ -138,6 +135,12 @@ function isTextAttachment(file: Pick<File, "name" | "type">) {
   );
 }
 
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function readHistory(): HistoryEntry[] {
   try {
     const parsed = JSON.parse(
@@ -148,6 +151,13 @@ function readHistory(): HistoryEntry[] {
           .filter((item): item is HistoryEntry =>
             Boolean(item?.id && item?.title && item?.updatedAt),
           )
+          .map((item) => ({
+            id: item.id,
+            title: item.title,
+            updatedAt: item.updatedAt,
+            archived: Boolean(item.archived),
+            archivedAt: typeof item.archivedAt === "string" ? item.archivedAt : null,
+          }))
           .slice(0, 30)
       : [];
   } catch {
@@ -239,6 +249,19 @@ function writeConversationApprovalMode(
 function isNetworkFailure(error: unknown) {
   if (!(error instanceof Error)) return false;
   return /failed to fetch|networkerror|network request failed/i.test(error.message);
+}
+
+function isLocalExecutorNotReady(error: unknown) {
+  return error instanceof StudioApiError
+    && error.status === 400
+    && /local computer control is not ready/i.test(error.message);
+}
+
+function localExecutorStartFailureHint(error: unknown, t: (key: string) => string) {
+  if (error instanceof Error && /still starting|timed out/i.test(error.message)) {
+    return t("localExecutorConnectTimeout");
+  }
+  return t("localExecutorAutoStartFailed");
 }
 
 function citationsUsedInAnswer(content: string, citations: Citation[]) {
@@ -352,15 +375,27 @@ function ConfirmDeleteButton({
   name,
   description,
   busy = false,
+  disabled = false,
   onConfirm,
 }: {
   name: string;
   description: string;
   busy?: boolean;
+  disabled?: boolean;
   onConfirm: () => void;
 }) {
   const { t } = useTranslation();
   const [confirming, setConfirming] = useState(false);
+  if (disabled)
+    return (
+      <IconButton
+        label={`${t("delete")} ${name}`}
+        disabled
+        onClick={() => undefined}
+      >
+        <Trash2 size={14} />
+      </IconButton>
+    );
   if (confirming)
     return (
       <span className="row-delete-confirm" role="alert">
@@ -402,12 +437,14 @@ function ConversationAttachmentShelf({
   deleting,
   onDownload,
   onDelete,
+  readOnly,
   t,
 }: {
   attachments: ConversationAttachment[];
   deleting: boolean;
   onDownload: (attachment: ConversationAttachment) => void;
   onDelete: (attachment: ConversationAttachment) => void;
+  readOnly: boolean;
   t: (key: string) => string;
 }) {
   if (!attachments.length) return null;
@@ -427,6 +464,7 @@ function ConversationAttachmentShelf({
               name={attachment.fileName}
               description={t("deleteAttachmentHint")}
               busy={deleting}
+              disabled={readOnly}
               onConfirm={() => onDelete(attachment)}
             />
           </div>
@@ -475,11 +513,13 @@ function App() {
     mcpServerIds: [],
     toolNames: [],
   });
+  const [capabilityDataRequested, setCapabilityDataRequested] = useState(false);
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(() =>
     readConversationApprovalMode(conversationId),
   );
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const [localExecutorRecoveryRequired, setLocalExecutorRecoveryRequired] = useState(false);
   const [skillPreflight, setSkillPreflight] = useState<SkillPreflight | null>(null);
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [historyEntries, setHistoryEntries] =
@@ -491,8 +531,8 @@ function App() {
     null,
   );
   const [recoveryRunIds, setRecoveryRunIds] = useState<string[]>([]);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [auditRunId, setAuditRunId] = useState<string | null>(null);
-  const [isNearConversationBottom, setIsNearConversationBottom] = useState(true);
   const abortControllersRef = useRef(new Map<string, AbortController>());
   const stopRequestedRunIdsRef = useRef(new Set<string>());
   const runInputRef = useRef(new Map<string, string>());
@@ -506,6 +546,7 @@ function App() {
   const configurationTriggerRef = useRef<HTMLButtonElement | null>(null);
   const sidebarTriggerRef = useRef<HTMLButtonElement | null>(null);
   const stageRef = useRef<HTMLElement>(null);
+  const isNearConversationBottomRef = useRef(true);
 
   const clearAttachments = useCallback(() => {
     setAttachments((current) => {
@@ -580,36 +621,47 @@ function App() {
       current === t("stoppingRun") ? null : current,
     );
   }, [t]);
+  const systemStatusQuery = useQuery({
+    queryKey: ["system-status"],
+    queryFn: studioApi.getSystemStatus,
+    retry: 0,
+    refetchInterval: (query) => query.state.status === "error" ? 5_000 : 15_000,
+  });
   const agentsQuery = useQuery({
     queryKey: ["agents"],
     queryFn: studioApi.listAgents,
-    retry: 1,
-    refetchInterval: 30_000,
+    retry: 0,
+    refetchInterval: (query) => query.state.status === "error" ? 5_000 : 30_000,
   });
   const modelsQuery = useQuery({
     queryKey: ["models"],
     queryFn: studioApi.listModels,
-    retry: 1,
-    refetchInterval: 30_000,
+    retry: 0,
+    refetchInterval: (query) => query.state.status === "error" ? 5_000 : 30_000,
   });
   const executionSettingsQuery = useQuery({
     queryKey: ["execution-settings"],
     queryFn: studioApi.getExecutionSettings,
-    retry: 1,
-    refetchInterval: 30_000,
+    retry: 0,
+    refetchInterval: (query) => query.state.status === "error" ? 5_000 : 30_000,
   });
   const executionMode = executionSettingsQuery.data?.mode ?? "PERSONAL_LOCAL";
-  const reconnecting = agentsQuery.isFetching || modelsQuery.isFetching;
   const handleReconnect = useCallback(async () => {
+    setIsReconnecting(true);
     setComposerNotice(t("reconnecting"));
-    const [agentsResult, modelsResult] = await Promise.all([
-      agentsQuery.refetch(),
-      modelsQuery.refetch(),
-    ]);
-    if (agentsResult.isError || modelsResult.isError)
-      setComposerNotice(t("backendOffline"));
-    else setComposerNotice(null);
-  }, [agentsQuery, modelsQuery, t]);
+    try {
+      await Promise.all([
+        systemStatusQuery.refetch(),
+        agentsQuery.refetch(),
+        modelsQuery.refetch(),
+      ]);
+      // The persistent composer status already explains the resolved outcome.
+      // Do not stack a second, less specific notice beneath it.
+      setComposerNotice(null);
+    } finally {
+      setIsReconnecting(false);
+    }
+  }, [agentsQuery, modelsQuery, systemStatusQuery, t]);
 
   useEffect(() => {
     if (!recoveryRunIds.length) return;
@@ -664,13 +716,40 @@ function App() {
   const currentAgent =
     availableAgents.find((agent) => agent.id === selectedAgentId) ??
     availableAgents[0];
+  const modelReady = availableModels.some(
+    (model) =>
+      model.id === (currentAgent?.defaultModelProfileId ?? defaultModelProfileId) &&
+      model.enabled &&
+      model.apiKeyConfigured &&
+      model.capabilities.includes("TEXT"),
+  );
+  const globalModelReady = availableModels.some(
+    (model) =>
+      model.id === defaultModelProfileId &&
+      model.enabled &&
+      model.apiKeyConfigured &&
+      model.capabilities.includes("TEXT"),
+  );
+  const agentModelOverrideUnavailable = Boolean(
+    !modelReady &&
+    globalModelReady &&
+    currentAgent?.defaultModelProfileId &&
+    currentAgent.defaultModelProfileId !== defaultModelProfileId,
+  );
   const backendAvailable =
     agentsQuery.isSuccess &&
     modelsQuery.isSuccess &&
     !agentsQuery.isError &&
     !modelsQuery.isError;
   const backendConnecting =
-    !backendAvailable && (agentsQuery.isPending || modelsQuery.isPending);
+    !backendAvailable &&
+    !systemStatusQuery.isError &&
+    (agentsQuery.isPending || modelsQuery.isPending);
+  const backendUnhealthy = [systemStatusQuery.error, agentsQuery.error, modelsQuery.error].some(
+    (error) => error instanceof StudioApiError && error.status >= 500,
+  );
+  const persistenceUnavailable = systemStatusQuery.error instanceof StudioApiError
+    && systemStatusQuery.error.code === "PERSISTENCE_UNAVAILABLE";
   const conversationQueueQuery = useQuery({
     queryKey: ["conversation-queue", conversationId],
     queryFn: () => studioApi.getConversationQueue(conversationId ?? ""),
@@ -726,6 +805,19 @@ function App() {
     },
     onError: (error) =>
       setComposerNotice(error instanceof Error ? error.message : t("attachmentReadFailed")),
+  });
+  const archiveConversationMutation = useMutation({
+    mutationFn: (id: string) => studioApi.archiveConversation(id),
+    onSuccess: (conversation) => {
+      rememberConversation(conversation.id, conversation.title, {
+        archived: conversation.archived,
+        archivedAt: conversation.archivedAt ?? null,
+      });
+      clearAttachments();
+      setComposerNotice(null);
+    },
+    onError: (error) =>
+      setComposerNotice(error instanceof Error ? error.message : t("archiveConversationFailed")),
   });
 
   useEffect(() => {
@@ -796,40 +888,38 @@ function App() {
     queryKey: ["tools"],
     queryFn: studioApi.listTools,
     retry: 1,
-    enabled: backendAvailable,
+    enabled: backendAvailable && (settingsOpen || capabilityDataRequested),
   });
   const knowledgeBasesQuery = useQuery({
     queryKey: ["knowledge-bases"],
     queryFn: studioApi.listKnowledgeBases,
     retry: 1,
-    enabled: backendAvailable,
+    enabled: backendAvailable && (settingsOpen || capabilityDataRequested),
   });
   const skillsQuery = useQuery({
     queryKey: ["skills"],
     queryFn: studioApi.listSkills,
     retry: 1,
-    enabled: backendAvailable,
+    enabled: backendAvailable && (settingsOpen || capabilityDataRequested),
   });
   const mcpQuery = useQuery({
     queryKey: ["mcp-connections"],
     queryFn: studioApi.listMcpConnections,
     retry: 1,
-    enabled: backendAvailable,
+    enabled: backendAvailable && (settingsOpen || capabilityDataRequested),
   });
   const nodesQuery = useQuery({
     queryKey: ["nodes"],
     queryFn: studioApi.listNodes,
     retry: 1,
-    enabled: backendAvailable,
+    enabled: backendAvailable && (settingsOpen || capabilityDataRequested),
+    // A local executor can connect, disconnect, or finish bootstrapping without
+    // another UI action. Keep this status fresh so users never have to close and
+    // reopen the management workspace to see the real machine state.
+    refetchInterval: settingsOpen || capabilityDataRequested
+      ? executionMode === "PERSONAL_LOCAL" ? 5_000 : 15_000
+      : false,
   });
-  const localExecutorNodeId = executionMode === "PERSONAL_LOCAL"
-    ? nodesQuery.data?.find(
-      (node) =>
-        node.kind === "MANAGED_LOCAL" &&
-        node.enabled &&
-        node.status?.toUpperCase() === "ONLINE",
-    )?.id
-    : undefined;
   const selectedCitation = messages
     .flatMap((message) => message.citations ?? [])
     .find((citation) => citation.id === sourceCitationId);
@@ -861,14 +951,28 @@ function App() {
   const currentHistory = conversationId
     ? historyEntries.find((entry) => entry.id === conversationId)
     : undefined;
+  const currentConversationArchived = Boolean(currentHistory?.archived);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.lang = i18n.language === "en" ? "en" : "zh-CN";
     document
       .querySelector('meta[name="theme-color"]')
-      ?.setAttribute("content", theme === "dark" ? "#101111" : "#f7f7f5");
+      ?.setAttribute(
+        "content",
+        theme === "dark" ? "#101111" : theme === "white" ? "#ffffff" : "#f7f7f5",
+      );
   }, [i18n.language, theme]);
+
+  useEffect(() => {
+    const handleGlobalSearch = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      setSearchOpen(true);
+    };
+    window.addEventListener("keydown", handleGlobalSearch);
+    return () => window.removeEventListener("keydown", handleGlobalSearch);
+  }, []);
 
   useEffect(() => {
     setBackendAvailable(backendAvailable);
@@ -900,25 +1004,31 @@ function App() {
       setCapabilityState((current) => ({ ...current, nodeId: undefined }));
   }, [capabilityState.nodeId, nodesQuery.data, nodesQuery.isSuccess]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Opening a task should start at its newest state, even after the user had
+    // intentionally scrolled upward in a previous task.
+    isNearConversationBottomRef.current = true;
+  }, [conversationId]);
+
+  useLayoutEffect(() => {
     const stage = stageRef.current;
-    if (!stage || !isNearConversationBottom) return;
-    const frame = requestAnimationFrame(() => {
-      stage.scrollTop = stage.scrollHeight;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [isNearConversationBottom, messages.length, lastMessage?.content, lastMessage?.isStreaming]);
+    if (!stage || !isNearConversationBottomRef.current) return;
+    stage.scrollTop = stage.scrollHeight;
+  }, [messages, lastMessage?.content, lastMessage?.isStreaming]);
 
   const handleConversationScroll = useCallback(() => {
     const stage = stageRef.current;
     if (!stage) return;
-    const distanceFromBottom =
-      stage.scrollHeight - stage.scrollTop - stage.clientHeight;
-    setIsNearConversationBottom(distanceFromBottom <= 48);
+    isNearConversationBottomRef.current =
+      stage.scrollHeight - stage.scrollTop - stage.clientHeight <= 48;
   }, []);
 
   const rememberConversation = useCallback(
-    (id: string, title: string) => {
+    (
+      id: string,
+      title: string,
+      meta?: { archived?: boolean; archivedAt?: string | null },
+    ) => {
       setHistoryEntries((current) => {
         const existing = current.find((entry) => entry.id === id);
         const next = [
@@ -926,6 +1036,10 @@ function App() {
             id,
             title: (existing?.title ?? title) || t("newTask"),
             updatedAt: new Date().toISOString(),
+            archived: meta?.archived ?? existing?.archived ?? false,
+            archivedAt:
+              meta?.archivedAt ??
+              (meta?.archived === false ? null : existing?.archivedAt ?? null),
           },
           ...current.filter((entry) => entry.id !== id),
         ];
@@ -1293,6 +1407,10 @@ function App() {
         const conversation = await studioApi.getConversation(id);
         setConversationId(conversation.id);
         setApprovalMode(readConversationApprovalMode(conversation.id));
+        rememberConversation(conversation.id, conversation.title, {
+          archived: conversation.archived,
+          archivedAt: conversation.archivedAt ?? null,
+        });
         let runs: RunView[] = [];
         try {
           runs = await studioApi.listConversationRuns(conversation.id);
@@ -1415,14 +1533,31 @@ function App() {
         setComposerNotice(null);
         window.setTimeout(() => textareaRef.current?.focus(), 0);
       } catch (error) {
-        setComposerNotice(
-          error instanceof Error ? error.message : t("loadFailed"),
-        );
+        if (
+          error instanceof StudioApiError &&
+          (error.status === 404 ||
+            error.code === "BAD_REQUEST" && /conversation not found/i.test(error.message))
+        ) {
+          // A browser can retain a conversation id after the backend data directory
+          // was reset or switched. Recover to a clean task instead of trapping the
+          // user on an unrecoverable "conversation not found" state.
+          setHistoryEntries((current) => {
+            const next = current.filter((entry) => entry.id !== id);
+            writeHistory(next);
+            return next;
+          });
+          resetTask();
+          setComposerNotice(t("conversationExpired"));
+        } else {
+          setComposerNotice(
+            error instanceof Error ? error.message : t("loadFailed"),
+          );
+        }
       } finally {
         setOpeningConversationId(null);
       }
     },
-    [openingConversationId, setConversationId, setMessages, t, trackRun],
+    [openingConversationId, rememberConversation, resetTask, setApprovalMode, setConversationId, setMessages, t, trackRun],
   );
 
   useEffect(() => {
@@ -1454,6 +1589,11 @@ function App() {
   const handleSend = useCallback(
     async (overrideText?: string, retryAttachmentIds?: string[]) => {
       if (isPreflighting) return;
+      setLocalExecutorRecoveryRequired(false);
+      if (currentConversationArchived) {
+        setComposerNotice(t("conversationArchivedHint"));
+        return;
+      }
       if (!backendAvailable) {
         setComposerNotice(t("backendOffline"));
         return;
@@ -1466,16 +1606,10 @@ function App() {
       const runInput = text || t("attachmentOnlyPrompt");
       const displayInput =
         text || t("attachmentOnlyPrompt");
-      let runNodeId = capabilityState.nodeId ?? localExecutorNodeId;
-      if (!runNodeId && executionMode === "PERSONAL_LOCAL") {
-        const latestNodes = await nodesQuery.refetch();
-        runNodeId = latestNodes.data?.find(
-          (node) =>
-            node.kind === "MANAGED_LOCAL" &&
-            node.enabled &&
-            node.status?.toUpperCase() === "ONLINE",
-        )?.id;
-      }
+      // Keep ordinary conversations independent of the local executor. The server
+      // resolves a managed local target only for a task that actually needs system
+      // tools, while an explicitly selected node remains an explicit target.
+      let runNodeId = capabilityState.nodeId;
       const hasSelectedCapabilities = Boolean(
         capabilityState.knowledgeBaseIds.length ||
         capabilityState.skillIds.length ||
@@ -1554,6 +1688,8 @@ function App() {
       trackRun(runId);
       let serverRunId: string | null = null;
       let shouldRecoverRun = false;
+      let localExecutorAutoStartFailed = false;
+      let localExecutorAutoStartFailureHint: string | null = null;
       let failureStage: "prepare" | "upload" | "launch" | "stream" = "prepare";
       try {
         const conversation = await ensureConversation(
@@ -1592,7 +1728,7 @@ function App() {
           ...(runNodeId ? { nodeId: runNodeId } : {}),
           approvalMode,
         };
-        const run = await studioApi.createRun({
+        const createRun = () => studioApi.createRun({
           conversationId: conversation,
           text: runInput,
           agentId: currentAgent?.id,
@@ -1602,6 +1738,67 @@ function App() {
           clientRequestId,
           ...selectedCapabilities,
         }, { idempotencyKey: clientRequestId });
+        let run;
+        try {
+          run = await createRun();
+        } catch (error) {
+          // The backend has classified this as an explicit desktop/system task
+          // and refused it because the managed local companion is offline.
+          // Wake the loopback launcher once, then retry the same idempotent run.
+          if (executionMode !== "PERSONAL_LOCAL" || !isLocalExecutorNotReady(error)) {
+            throw error;
+          }
+          updateAssistant(runId, (message) => ({
+            ...message,
+            steps: [
+              ...(message.steps ?? []),
+              {
+                id: "local-executor-start",
+                kind: "execution",
+                label: t("localExecutorAutoStarting"),
+                status: "running",
+              },
+            ],
+          }));
+          setComposerNotice(t("localExecutorAutoStarting"));
+          try {
+            await studioApi.startLocalExecutor();
+            const nextNodes = await studioApi.waitForManagedLocalExecutorOnline();
+            queryClient.setQueryData(["nodes"], nextNodes);
+          } catch (startError) {
+            localExecutorAutoStartFailed = true;
+            const failureHint = localExecutorStartFailureHint(startError, t);
+            localExecutorAutoStartFailureHint = failureHint;
+            setLocalExecutorRecoveryRequired(
+              failureHint === t("localExecutorAutoStartFailed"),
+            );
+            updateAssistant(runId, (message) => ({
+              ...message,
+              steps: (message.steps ?? []).map((step) =>
+                step.id === "local-executor-start"
+                  ? {
+                      ...step,
+                      status: "failed",
+                      detail: failureHint,
+                      duration: t("stepFailed"),
+                    }
+                  : step,
+              ),
+            }));
+            setComposerNotice(failureHint);
+            throw startError;
+          }
+          updateAssistant(runId, (message) => ({
+            ...message,
+            steps: (message.steps ?? []).map((step) =>
+              step.id === "local-executor-start"
+                ? { ...step, status: "complete", duration: t("stepDone") }
+                : step,
+            ),
+          }));
+          setComposerNotice(null);
+          run = await createRun();
+        }
         serverRunId = run.runId;
         if (!retryAttachmentIds?.length)
           clearSentAttachments(localAttachments.map((attachment) => attachment.id));
@@ -1703,6 +1900,8 @@ function App() {
             error: backendAvailable
               ? isNetworkFailure(error)
                 ? t("backendOffline")
+                : localExecutorAutoStartFailed
+                  ? localExecutorAutoStartFailureHint ?? t("localExecutorAutoStartFailed")
                 : failureStage === "upload"
                   ? t("attachmentUploadFailed")
                   : failureStage === "stream"
@@ -1724,6 +1923,7 @@ function App() {
       approvalMode,
       backendAvailable,
       capabilityState,
+      currentConversationArchived,
       clearSentAttachments,
       currentAgent?.defaultModelProfileId,
       currentAgent?.defaultSkillIds,
@@ -1734,8 +1934,6 @@ function App() {
       finishRun,
       handleRunEvent,
       isPreflighting,
-      localExecutorNodeId,
-      nodesQuery,
       prompt,
       queryClient,
       reconcileRunLaunch,
@@ -1754,11 +1952,20 @@ function App() {
 
   const handleApprovalModeChange = useCallback(
     (next: ApprovalMode) => {
+      if (currentConversationArchived) {
+        setComposerNotice(t("conversationArchivedHint"));
+        return;
+      }
       setApprovalMode(next);
       if (conversationId) writeConversationApprovalMode(conversationId, next);
     },
-    [conversationId],
+    [conversationId, currentConversationArchived, t],
   );
+
+  const handleArchiveConversation = useCallback(() => {
+    if (!conversationId || currentConversationArchived || archiveConversationMutation.isPending) return;
+    void archiveConversationMutation.mutateAsync(conversationId);
+  }, [archiveConversationMutation, conversationId, currentConversationArchived]);
 
   const handleCancelRun = useCallback(async (runId: string) => {
     if (!runId || runId.startsWith("pending-") || stoppingRunIds.includes(runId)) return;
@@ -1828,6 +2035,10 @@ function App() {
 
   const retryMessage = useCallback(
     (message: StudioMessage) => {
+      if (currentConversationArchived) {
+        setComposerNotice(t("conversationArchivedHint"));
+        return;
+      }
       if (!message.runId || message.runId.startsWith("pending-")) return;
       const sourceRunId = message.runId;
       const provisionalRunId = `pending-retry-${Date.now()}`;
@@ -1913,11 +2124,15 @@ function App() {
         }
       })();
     },
-    [conversationId, finishRun, handleRunEvent, replaceTrackedRun, setMessages, t, trackRun, updateAssistant],
+    [conversationId, currentConversationArchived, finishRun, handleRunEvent, replaceTrackedRun, setMessages, t, trackRun, updateAssistant],
   );
 
   const handleApproval = useCallback(
     async (message: StudioMessage, approved: boolean) => {
+      if (currentConversationArchived) {
+        setComposerNotice(t("conversationArchivedHint"));
+        return;
+      }
       if (!message.runId || !message.approvalId || approvingApprovalId) return;
       setApprovingApprovalId(message.approvalId);
       try {
@@ -1939,10 +2154,14 @@ function App() {
         setApprovingApprovalId(null);
       }
     },
-    [approvingApprovalId, t, updateAssistant],
+    [approvingApprovalId, currentConversationArchived, t, updateAssistant],
   );
 
   const handleAttach = (files: File[]) => {
+    if (currentConversationArchived) {
+      setComposerNotice(t("conversationArchivedHint"));
+      return;
+    }
     const accepted: Attachment[] = [];
     let hasOversizedFile = false;
 
@@ -1988,6 +2207,7 @@ function App() {
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.nativeEvent.isComposing) return;
+    if (currentConversationArchived) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void handleSend();
@@ -2052,7 +2272,7 @@ function App() {
         ) : null}
         <main className="studio-main">
           <div
-            className="workspace-view"
+            className={`workspace-view ${messages.length === 0 ? "is-empty-view" : ""}`}
             aria-hidden={settingsOpen || sidebarOpen}
             inert={settingsOpen || sidebarOpen || undefined}
           >
@@ -2067,32 +2287,50 @@ function App() {
               >
                 <Menu size={18} />
               </IconButton>
-              <div className="conversation-title">
-                <span>
-                  {conversationId
-                    ? (currentHistory?.title ?? t("newTask"))
-                    : t("newTask")}
-                </span>
-              </div>
+              <span className="conversation-title" aria-label={currentHistory?.title ?? t("newTask")}>
+                <span className="conversation-title-copy">{currentHistory?.title ?? t("newTask")}</span>
+              </span>
             </div>
             <div className="topbar-actions">
-              <AgentSelect
-                agents={availableAgents}
-                currentAgent={currentAgent}
-                loading={agentsQuery.isPending}
-                onChange={setSelectedAgentId}
-                t={t}
-              />
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger asChild>
+                  <button className="agent-trigger" type="button" aria-label={t("agents")} title={t("agents")}>
+                    <span className="agent-avatar"><Bot size={15} /></span>
+                    <span className="agent-trigger-copy">
+                      <small>{t("agents")}</small>
+                      <strong>{currentAgent?.name ?? t("agents")}</strong>
+                    </span>
+                    <ChevronDown size={14} />
+                  </button>
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Portal>
+                  <DropdownMenu.Content className="menu" align="end" sideOffset={8}>
+                    <DropdownMenu.Label className="menu-label">{t("agents")}</DropdownMenu.Label>
+                    {availableAgents.map((agent) => (
+                      <DropdownMenu.Item
+                        className="menu-item"
+                        key={agent.id}
+                        onSelect={() => setSelectedAgentId(agent.id)}
+                      >
+                        <Bot size={15} />
+                        {agent.name}
+                        {agent.id === currentAgent?.id ? <Check size={15} className="menu-item-check" /> : null}
+                      </DropdownMenu.Item>
+                    ))}
+                    <DropdownMenu.Separator className="menu-separator" />
+                    <DropdownMenu.Item className="menu-item" onSelect={() => openConfiguration("agents")}>
+                      <Settings2 size={15} /> {t("manage")}
+                    </DropdownMenu.Item>
+                  </DropdownMenu.Content>
+                </DropdownMenu.Portal>
+              </DropdownMenu.Root>
               <button
                 className="manage-button"
                 type="button"
-                aria-label={t("manage")}
-                onClick={(event) =>
-                  openConfiguration("agents", event.currentTarget)
-                }
+                onClick={(event) => openConfiguration("agents", event.currentTarget)}
               >
                 <Settings2 size={15} />
-                <span>{t("manage")}</span>
+                {t("manage")}
               </button>
               <DropdownMenu.Root>
                 <DropdownMenu.Trigger asChild>
@@ -2115,16 +2353,27 @@ function App() {
                     </DropdownMenu.Label>
                     <DropdownMenu.Item
                       className="menu-item"
-                      onSelect={() =>
-                        setTheme(theme === "light" ? "dark" : "light")
-                      }
+                      onSelect={() => setTheme("dark")}
                     >
-                      {theme === "light" ? (
-                        <Moon size={15} />
-                      ) : (
-                        <Sun size={15} />
-                      )}{" "}
-                      {theme === "light" ? t("dark") : t("light")}
+                      <Moon size={15} />
+                      {t("dark")}
+                      {theme === "dark" ? <Check size={15} className="menu-item-check" /> : null}
+                    </DropdownMenu.Item>
+                    <DropdownMenu.Item
+                      className="menu-item"
+                      onSelect={() => setTheme("light")}
+                    >
+                      <Sun size={15} />
+                      {t("warm")}
+                      {theme === "light" ? <Check size={15} className="menu-item-check" /> : null}
+                    </DropdownMenu.Item>
+                    <DropdownMenu.Item
+                      className="menu-item"
+                      onSelect={() => setTheme("white")}
+                    >
+                      <Sun size={15} />
+                      {t("white")}
+                      {theme === "white" ? <Check size={15} className="menu-item-check" /> : null}
                     </DropdownMenu.Item>
                     <DropdownMenu.Item
                       className="menu-item"
@@ -2143,6 +2392,28 @@ function App() {
                     >
                       <Plus size={15} /> {t("newTask")}
                     </DropdownMenu.Item>
+                    {conversationId ? (
+                      currentConversationArchived ? (
+                        <DropdownMenu.Item className="menu-item" disabled>
+                          <Archive size={15} /> {t("archived")}
+                        </DropdownMenu.Item>
+                      ) : (
+                        <DropdownMenu.Item
+                          className="menu-item"
+                          disabled={archiveConversationMutation.isPending}
+                          onSelect={handleArchiveConversation}
+                        >
+                          {archiveConversationMutation.isPending ? (
+                            <LoaderCircle size={15} className="spin" />
+                          ) : (
+                            <Archive size={15} />
+                          )}{" "}
+                          {archiveConversationMutation.isPending
+                            ? t("archivingConversation")
+                            : t("archiveConversation")}
+                        </DropdownMenu.Item>
+                      )
+                    ) : null}
                   </DropdownMenu.Content>
                 </DropdownMenu.Portal>
               </DropdownMenu.Root>
@@ -2155,7 +2426,7 @@ function App() {
             ref={stageRef}
             onScroll={handleConversationScroll}
           >
-            <div className="message-feed">
+            <div className={`message-feed ${messages.length === 0 ? "is-empty" : ""}`}>
               {messages.map((message) => {
                 return (
                   <Fragment key={message.id}>
@@ -2169,10 +2440,14 @@ function App() {
                       }
                       onCitation={setSourceCitationId}
                       onCopy={() => void handleCopy(message)}
-                      onRetry={() => retryMessage(message)}
-                      onViewAudit={() => setAuditRunId(message.runId ?? null)}
+                      onRetry={() =>
+                        message.runId?.startsWith("pending-")
+                          ? void handleSend(message.retryInput)
+                          : retryMessage(message)
+                      }
                       onCancelRun={handleCancelRun}
                       onApproval={handleApproval}
+                      readOnly={currentConversationArchived}
                       approving={approvingApprovalId === message.approvalId}
                       cancelling={Boolean(message.runId && stoppingRunIds.includes(message.runId))}
                       copied={copiedId === message.id}
@@ -2186,6 +2461,7 @@ function App() {
                 deleting={deleteConversationAttachment.isPending}
                 onDownload={(attachment) => void handleDownloadAttachment(attachment)}
                 onDelete={(attachment) => deleteConversationAttachment.mutate(attachment.id)}
+                readOnly={currentConversationArchived}
                 t={t}
               />
             </div>
@@ -2202,15 +2478,24 @@ function App() {
             running={Boolean(activeConversationRunId)}
             stopping={Boolean(activeConversationRunId && stoppingRunIds.includes(activeConversationRunId))}
             backendAvailable={backendAvailable}
+            backendUnhealthy={backendUnhealthy}
+            persistenceUnavailable={persistenceUnavailable}
+            modelReady={modelReady}
+            agentModelOverrideUnavailable={agentModelOverrideUnavailable}
             connecting={backendConnecting}
-            reconnecting={reconnecting}
+            reconnecting={isReconnecting}
             onReconnect={() => void handleReconnect()}
+            onOpenModels={() => openConfiguration("models")}
+            onOpenAgents={() => openConfiguration("agents")}
+            onOpenNodes={() => openConfiguration("nodes")}
             textareaRef={textareaRef}
             t={t}
             onAttach={(files) => void handleAttach(files)}
             attachments={attachments}
             onRemoveAttachment={removeAttachment}
             composerNotice={composerNotice}
+            localExecutorRecoveryRequired={localExecutorRecoveryRequired}
+            readOnly={currentConversationArchived}
             preflighting={isPreflighting}
             skillPreflight={skillPreflight}
             agentToolAllowList={currentAgent?.toolAllowList}
@@ -2220,7 +2505,9 @@ function App() {
             mcpQuery={mcpQuery}
             nodesQuery={nodesQuery}
             capabilityState={capabilityState}
+            empty={messages.length === 0}
             onCapabilityChange={handleCapabilityChange}
+            onCapabilityMenuOpen={() => setCapabilityDataRequested(true)}
             approvalMode={approvalMode}
             onApprovalModeChange={handleApprovalModeChange}
           />
@@ -2268,6 +2555,10 @@ function App() {
           open={searchOpen}
           onOpenChange={setSearchOpen}
           messages={messages}
+          entries={historyEntries}
+          openingId={openingConversationId}
+          onOpenConversation={openConversation}
+          language={i18n.language}
           t={t}
         />
         <HistoryDialog
@@ -2460,7 +2751,7 @@ function Sidebar({
               <span>{t("workspace")}</span>
             </div>
             <IconButton label={t("close")} onClick={() => closeNavigation(true)}>
-              <X size={17} />
+              <PanelLeftClose size={17} />
             </IconButton>
           </header>
           <div className="sidebar-panel-body">
@@ -2514,7 +2805,17 @@ function Sidebar({
                       }}
                     >
                       <History size={15} />
-                      <span aria-hidden="true">{entry.title}</span>
+                      <span className="recent-conversation-copy">
+                        <span className="recent-conversation-title" aria-hidden="true">
+                          {entry.title}
+                        </span>
+                        {entry.archived ? (
+                          <span className="conversation-state-badge is-inline">
+                            <Archive size={11} />
+                            {t("archived")}
+                          </span>
+                        ) : null}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -2591,11 +2892,19 @@ function SearchDialog({
   open,
   onOpenChange,
   messages,
+  entries,
+  openingId,
+  onOpenConversation,
+  language,
   t,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   messages: StudioMessage[];
+  entries: HistoryEntry[];
+  openingId: string | null;
+  onOpenConversation: (id: string) => void;
+  language: string;
   t: (key: string) => string;
 }) {
   const [query, setQuery] = useState("");
@@ -2603,11 +2912,14 @@ function SearchDialog({
     if (open) setQuery("");
   }, [open]);
   const normalized = query.trim().toLowerCase();
-  const results = normalized
+  const messageResults = normalized
     ? messages.filter((message) =>
         message.content.toLowerCase().includes(normalized),
       )
     : [];
+  const conversationResults = normalized
+    ? entries.filter((entry) => entry.title.toLowerCase().includes(normalized))
+    : entries.slice(0, 5);
   const jumpToMessage = (id: string | number) => {
     onOpenChange(false);
     window.setTimeout(() => {
@@ -2655,10 +2967,35 @@ function SearchDialog({
                 aria-label={t("searchPlaceholder")}
               />
             </div>
-            {query.trim() ? (
-              <div className="search-results">
-                {results.length ? (
-                  results.map((message) => (
+            {conversationResults.length ? (
+              <section className="search-group" aria-label={t("searchConversations")}>
+                <div className="search-group-heading">{t("searchConversations")}</div>
+                <div className="search-results">
+                  {conversationResults.map((entry) => (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      className="search-result search-conversation-result"
+                      onClick={() => onOpenConversation(entry.id)}
+                      disabled={Boolean(openingId)}
+                      aria-busy={openingId === entry.id || undefined}
+                    >
+                      <span className="history-item-icon"><History size={14} /></span>
+                      <span className="search-result-copy">
+                        <strong>{entry.title}</strong>
+                        <small>{formatHistoryTimestamp(entry.updatedAt, language)}</small>
+                      </span>
+                      {openingId === entry.id ? <LoaderCircle size={15} className="spin" /> : <ChevronRight size={15} />}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+            {messageResults.length ? (
+              <section className="search-group" aria-label={t("searchMessages")}>
+                <div className="search-group-heading">{t("searchMessages")}</div>
+                <div className="search-results">
+                  {messageResults.map((message) => (
                     <button
                       key={message.id}
                       type="button"
@@ -2666,20 +3003,17 @@ function SearchDialog({
                       onClick={() => jumpToMessage(message.id)}
                     >
                       <span className="search-result-role">
-                        {message.role === "USER"
-                          ? t("you")
-                          : t("digitalEmployee")}
+                        {message.role === "USER" ? t("you") : t("digitalEmployee")}
                       </span>
                       <span>{message.content}</span>
                     </button>
-                  ))
-                ) : (
-                  <div className="utility-empty">{t("noSearchResults")}</div>
-                )}
-              </div>
-            ) : (
-              <div className="utility-empty">{t("searchPrompt")}</div>
-            )}
+                  ))}
+                </div>
+              </section>
+            ) : null}
+            {!conversationResults.length && !messageResults.length ? (
+              <div className="utility-empty">{query.trim() ? t("noSearchResults") : t("searchPrompt")}</div>
+            ) : null}
           </div>
           <div className="dialog-footer">
             <Dialog.Close asChild>
@@ -2748,7 +3082,15 @@ function HistoryDialog({
                       <History size={15} />
                     </span>
                     <span className="history-item-copy">
-                      <strong>{entry.title}</strong>
+                      <span className="history-item-title-row">
+                        <strong>{entry.title}</strong>
+                        {entry.archived ? (
+                          <span className="conversation-state-badge is-inline">
+                            <Archive size={11} />
+                            {t("archived")}
+                          </span>
+                        ) : null}
+                      </span>
                       <small>
                         {formatHistoryTimestamp(entry.updatedAt, language)}
                       </small>
@@ -2783,78 +3125,6 @@ function HistoryDialog({
   );
 }
 
-function AgentSelect({
-  agents,
-  currentAgent,
-  loading,
-  onChange,
-  t,
-}: {
-  agents: Agent[];
-  currentAgent?: Agent;
-  loading: boolean;
-  onChange: (id: string) => void;
-  t: (key: string) => string;
-}) {
-  const enabledAgents = agents.filter((agent) => agent.enabled);
-  return (
-    <DropdownMenu.Root>
-      <DropdownMenu.Trigger asChild>
-        <button
-          className="agent-trigger"
-          type="button"
-          aria-label={`${t("digitalEmployee")} ${currentAgent?.name ?? ""}`}
-          aria-busy={loading}
-        >
-          <span className="agent-avatar">
-            <Bot size={15} />
-          </span>
-          <span className="agent-trigger-copy">
-            <small>{t("digitalEmployee")}</small>
-            <strong>{currentAgent?.name ?? t("digitalEmployee")}</strong>
-          </span>
-          <ChevronDown size={14} />
-        </button>
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          className="menu agent-menu"
-          align="end"
-          sideOffset={8}
-        >
-          {loading ? (
-            <DropdownMenu.Item className="menu-item agent-empty" disabled>
-              <LoaderCircle size={14} className="spin" />
-              {t("loading")}
-            </DropdownMenu.Item>
-          ) : enabledAgents.length ? (
-            enabledAgents.map((agent) => (
-              <DropdownMenu.Item
-                key={agent.id}
-                className="agent-option"
-                onSelect={() => onChange(agent.id)}
-              >
-                <span className="agent-avatar">
-                  <Bot size={14} />
-                </span>
-                <span>
-                  <strong>{agent.name}</strong>
-                  <small>{agent.description}</small>
-                </span>
-                {agent.id === currentAgent?.id ? <Check size={14} /> : null}
-              </DropdownMenu.Item>
-            ))
-          ) : (
-            <DropdownMenu.Item className="menu-item agent-empty" disabled>
-              {t("noAgents")}
-            </DropdownMenu.Item>
-          )}
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  );
-}
-
 function MessageBlock({
   message,
   expanded,
@@ -2862,9 +3132,9 @@ function MessageBlock({
   onCitation,
   onCopy,
   onRetry,
-  onViewAudit,
   onCancelRun,
   onApproval,
+  readOnly,
   approving,
   cancelling,
   copied,
@@ -2876,9 +3146,9 @@ function MessageBlock({
   onCitation: (id: string) => void;
   onCopy: () => void;
   onRetry: () => void;
-  onViewAudit: () => void;
   onCancelRun: (runId: string) => void;
   onApproval: (message: StudioMessage, approved: boolean) => void;
+  readOnly: boolean;
   approving: boolean;
   cancelling: boolean;
   copied: boolean;
@@ -2915,8 +3185,9 @@ function MessageBlock({
   );
   const failed = message.runState === "failed" || message.runState === "timedOut" || message.runState === "interrupted";
   const canRetry = Boolean(
+    !readOnly &&
     message.runId &&
-      !message.runId.startsWith("pending-") &&
+      (!message.runId.startsWith("pending-") || Boolean(message.retryInput)) &&
       (failed || cancelled || needsVerification) && !unknown,
   );
   const hasRunning =
@@ -3038,6 +3309,7 @@ function MessageBlock({
               type="button"
               disabled={
                 approving ||
+                readOnly ||
                 message.approvalDecision === "approved" ||
                 message.approvalDecision === "rejected"
               }
@@ -3050,6 +3322,7 @@ function MessageBlock({
               type="button"
               disabled={
                 approving ||
+                readOnly ||
                 message.approvalDecision === "approved" ||
                 message.approvalDecision === "rejected"
               }
@@ -3120,7 +3393,7 @@ function MessageBlock({
               <RotateCcw size={14} />
             </IconButton>
           ) : null}
-          {message.runId && !message.runId.startsWith("pending-") ? (
+          {canCancel && message.runId ? (
             <DropdownMenu.Root>
               <DropdownMenu.Trigger asChild>
                 <button className="icon-button" type="button" aria-label={t("more")} title={t("more")}>
@@ -3130,21 +3403,13 @@ function MessageBlock({
               <DropdownMenu.Portal>
                 <DropdownMenu.Content className="menu" align="start" sideOffset={6}>
                   <DropdownMenu.Item
-                    className="menu-item"
-                    onSelect={onViewAudit}
+                    className="menu-item danger"
+                    disabled={cancelling}
+                    onSelect={() => onCancelRun(message.runId!)}
                   >
-                    <ShieldCheck size={14} /> {t("runAudit")}
+                    {cancelling ? <LoaderCircle size={14} className="spin" /> : <CircleStop size={14} />}
+                    {t("stop")}
                   </DropdownMenu.Item>
-                  {canCancel && message.runId ? (
-                    <DropdownMenu.Item
-                      className="menu-item danger"
-                      disabled={cancelling}
-                      onSelect={() => onCancelRun(message.runId!)}
-                    >
-                      {cancelling ? <LoaderCircle size={14} className="spin" /> : <CircleStop size={14} />}
-                      {t("stop")}
-                    </DropdownMenu.Item>
-                  ) : null}
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
@@ -3219,27 +3484,38 @@ function Composer({
   running,
   stopping,
   backendAvailable,
+  backendUnhealthy,
+  persistenceUnavailable,
+  modelReady,
+  agentModelOverrideUnavailable,
   connecting,
   reconnecting,
   onReconnect,
+  onOpenModels,
+  onOpenAgents,
+  onOpenNodes,
   textareaRef,
   t,
   onAttach,
   attachments,
   onRemoveAttachment,
   composerNotice,
+  localExecutorRecoveryRequired,
   preflighting,
-  skillPreflight,
-  agentToolAllowList,
+  skillPreflight: _skillPreflight,
+  agentToolAllowList: _agentToolAllowList,
   toolsQuery,
   knowledgeBasesQuery,
   skillsQuery,
   mcpQuery,
   nodesQuery,
   capabilityState,
+  empty,
   onCapabilityChange,
+  onCapabilityMenuOpen: _onCapabilityMenuOpen,
   approvalMode,
   onApprovalModeChange,
+  readOnly,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -3249,15 +3525,23 @@ function Composer({
   running: boolean;
   stopping: boolean;
   backendAvailable: boolean;
+  backendUnhealthy: boolean;
+  persistenceUnavailable: boolean;
+  modelReady: boolean;
+  agentModelOverrideUnavailable: boolean;
   connecting: boolean;
   reconnecting: boolean;
   onReconnect: () => void;
+  onOpenModels: () => void;
+  onOpenAgents: () => void;
+  onOpenNodes: () => void;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
   t: (key: string) => string;
   onAttach: (files: File[]) => void;
   attachments: Attachment[];
   onRemoveAttachment: (id: string) => void;
   composerNotice: string | null;
+  localExecutorRecoveryRequired: boolean;
   preflighting: boolean;
   skillPreflight: SkillPreflight | null;
   agentToolAllowList?: string[];
@@ -3267,9 +3551,12 @@ function Composer({
   mcpQuery: { data?: McpConnection[] };
   nodesQuery: { data?: NodeConnection[] };
   capabilityState: CapabilityState;
+  empty: boolean;
   onCapabilityChange: (state: CapabilityState) => void;
+  onCapabilityMenuOpen: () => void;
   approvalMode: ApprovalMode;
   onApprovalModeChange: (mode: ApprovalMode) => void;
+  readOnly: boolean;
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
@@ -3287,12 +3574,6 @@ function Composer({
       node.status?.toUpperCase() === "ONLINE",
   );
 
-  const totalCapabilities =
-    capabilityState.knowledgeBaseIds.length +
-    capabilityState.skillIds.length +
-    capabilityState.mcpServerIds.length +
-    capabilityState.toolNames.length +
-    (capabilityState.nodeId ? 1 : 0);
   const builtInTools = (toolsQuery.data ?? []).filter(
     (tool) => !isExternalToolName(tool.name),
   );
@@ -3324,18 +3605,20 @@ function Composer({
     });
   };
   return (
-    <div className="composer-wrap">
+    <div className={`composer-wrap ${empty ? "is-empty-composer" : ""}`}>
       <div
-        className={`composer ${dragActive ? "is-drag-active" : ""}`}
+        className={`composer ${dragActive ? "is-drag-active" : ""} ${readOnly ? "is-readonly" : ""}`}
         onDragEnter={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
           event.preventDefault();
+          if (readOnly) return;
           dragDepthRef.current += 1;
           setDragActive(true);
         }}
         onDragOver={(event) => {
-          if (Array.from(event.dataTransfer.types).includes("Files"))
-            event.preventDefault();
+          if (!Array.from(event.dataTransfer.types).includes("Files")) return;
+          event.preventDefault();
+          if (readOnly) return;
         }}
         onDragLeave={(event) => {
           if (!Array.from(event.dataTransfer.types).includes("Files")) return;
@@ -3344,9 +3627,10 @@ function Composer({
           if (!dragDepthRef.current) setDragActive(false);
         }}
         onDrop={(event) => {
+          event.preventDefault();
+          if (readOnly) return;
           const files = Array.from(event.dataTransfer.files);
           if (!files.length) return;
-          event.preventDefault();
           dragDepthRef.current = 0;
           setDragActive(false);
           onAttach(files);
@@ -3359,7 +3643,12 @@ function Composer({
           aria-hidden="true"
           tabIndex={-1}
           multiple
+          disabled={readOnly}
           onChange={(event) => {
+            if (readOnly) {
+              event.currentTarget.value = "";
+              return;
+            }
             onAttach(Array.from(event.target.files ?? []));
             event.currentTarget.value = "";
           }}
@@ -3375,6 +3664,7 @@ function Composer({
                   type="button"
                   aria-label={`${t("removeCapability")} ${chip.label}`}
                   title={t("removeCapability")}
+                  disabled={readOnly}
                   onClick={() => removeCapability(chip)}
                 >
                   <X size={12} />
@@ -3400,6 +3690,7 @@ function Composer({
                 <button
                   type="button"
                   aria-label={`${t("removeAttachment")} ${file.name}`}
+                  disabled={readOnly}
                   onClick={() => onRemoveAttachment(file.id)}
                 >
                   <X size={12} />
@@ -3408,60 +3699,40 @@ function Composer({
             ))}
           </div>
         ) : null}
-        {approvalMode === "full-access" ? (
-          <div className="selected-capability-row" aria-label={t("approvalMode")}>
-            <span className="selected-capability-chip">
-              <ShieldCheck size={12} />
-              <span className="selected-capability-kind">{t("approvalMode")}</span>
-              <span>{t("fullAccess")}</span>
-              <button
-                type="button"
-                aria-label={t("restoreApproval")}
-                title={t("restoreApproval")}
-                onClick={() => onApprovalModeChange("on-request")}
-              >
-                <X size={12} />
-              </button>
-            </span>
-          </div>
-        ) : null}
         <div className="composer-input-row">
-          <IconButton
-            label={t("attach")}
-            onClick={() => fileRef.current?.click()}
-          >
-            <Paperclip size={17} />
-          </IconButton>
           <textarea
             ref={textareaRef}
             value={value}
             onChange={(event) => onChange(event.target.value)}
             onPaste={(event) => {
+              if (readOnly) return;
               const files = Array.from(event.clipboardData.files);
               if (!files.length) return;
               event.preventDefault();
               onAttach(files);
             }}
             onKeyDown={onKeyDown}
+            readOnly={readOnly}
+            aria-disabled={readOnly}
             placeholder={t("placeholder")}
             rows={1}
             aria-label={t("placeholder")}
           />
-          <CapabilityMenu
-            tools={builtInTools.filter((tool) =>
-              agentToolAllowList ? agentToolAllowList.includes(tool.name) : true,
-            )}
-            knowledgeBases={knowledgeBasesQuery.data ?? []}
-            skills={skillsQuery.data ?? []}
-            mcpConnections={mcpQuery.data ?? []}
-            nodes={registeredOnlineNodes}
-            state={capabilityState}
-            onChange={onCapabilityChange}
-            t={t}
-            count={totalCapabilities}
-            skillPreflight={skillPreflight}
+        </div>
+        <div className="composer-action-row">
+          <IconButton
+            label={t("attach")}
+            onClick={() => fileRef.current?.click()}
+            disabled={readOnly}
+          >
+            <Plus size={22} />
+          </IconButton>
+          <div className="composer-action-controls">
+          <ApprovalModeMenu
             approvalMode={approvalMode}
             onApprovalModeChange={onApprovalModeChange}
+            t={t}
+            disabled={readOnly}
           />
           {running ? (
             <button
@@ -3483,18 +3754,25 @@ function Composer({
               className="send-button"
               onClick={onSend}
               disabled={
-                preflighting || !backendAvailable || (!value.trim() && !attachments.length)
+                preflighting || readOnly || !backendAvailable || !modelReady || (!value.trim() && !attachments.length)
               }
               aria-label={preflighting ? t("preflightingSkills") : t("send")}
             >
               {preflighting ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={17} />}
             </button>
           )}
+          </div>
         </div>
+        {readOnly ? (
+          <div className="composer-state" role="status" aria-live="polite">
+            <Archive size={13} />
+            <span>{t("conversationArchivedHint")}</span>
+          </div>
+        ) : null}
         {!backendAvailable || connecting ? (
           <div className="composer-status">
             {connecting ? <LoaderCircle size={12} className="spin" /> : <span className="context-dot" data-online={backendAvailable} />}
-            <span>{connecting ? t("connecting") : t("offline")}</span>
+            <span>{connecting ? t("connecting") : persistenceUnavailable ? t("backendPersistenceUnavailable") : backendUnhealthy ? t("backendUnhealthy") : t("offline")}</span>
             {!backendAvailable && !connecting ? (
               <button
                 type="button"
@@ -3508,10 +3786,28 @@ function Composer({
             ) : null}
           </div>
         ) : null}
+        {backendAvailable && !modelReady ? (
+          <div className="composer-status composer-status-warning" role="status">
+            <CircleAlert size={13} />
+            <span>{t(agentModelOverrideUnavailable ? "agentModelOverrideUnavailableHint" : "modelSetupHint")}</span>
+            <button
+              type="button"
+              className="connection-retry"
+              onClick={agentModelOverrideUnavailable ? onOpenAgents : onOpenModels}
+            >
+              {t(agentModelOverrideUnavailable ? "configureAgent" : "configureModel")}
+            </button>
+          </div>
+        ) : null}
         {composerNotice ? (
           <div className="composer-notice" role="status" aria-live="polite">
             <CircleAlert size={13} />
-            {composerNotice}
+            <span>{composerNotice}</span>
+            {localExecutorRecoveryRequired ? (
+              <button type="button" className="connection-retry" onClick={onOpenNodes}>
+                {t("localExecutorCapabilities")}
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -3519,7 +3815,70 @@ function Composer({
   );
 }
 
-function CapabilityMenu({
+function ApprovalModeMenu({
+  approvalMode,
+  onApprovalModeChange,
+  t,
+  disabled,
+}: {
+  approvalMode: ApprovalMode;
+  onApprovalModeChange: (mode: ApprovalMode) => void;
+  t: (key: string) => string;
+  disabled: boolean;
+}) {
+  const fullAccess = approvalMode === "full-access";
+  const SelectedIcon = fullAccess ? ShieldAlert : ShieldCheck;
+
+  return (
+    <DropdownMenu.Root modal={false}>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          className={`approval-mode-trigger ${fullAccess ? "is-full-access" : ""}`}
+          aria-label={fullAccess ? t("fullAccess") : t("approvalOnRequest")}
+          title={t("approvalMode")}
+          disabled={disabled}
+        >
+          <SelectedIcon size={16} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="menu approval-mode-menu" align="end" side="top" sideOffset={8}>
+          <DropdownMenu.Label className="approval-mode-menu-title">
+            {t("approvalMode")}
+          </DropdownMenu.Label>
+          <DropdownMenu.RadioGroup
+            value={approvalMode}
+            onValueChange={(value) => onApprovalModeChange(value as ApprovalMode)}
+          >
+            <DropdownMenu.RadioItem value="on-request" className="approval-mode-item">
+              <ShieldCheck size={16} />
+              <span>
+                <strong>{t("approvalOnRequest")}</strong>
+                <small>{t("approvalOnRequestHint")}</small>
+              </span>
+              <DropdownMenu.ItemIndicator className="item-indicator">
+                <Check size={14} />
+              </DropdownMenu.ItemIndicator>
+            </DropdownMenu.RadioItem>
+            <DropdownMenu.RadioItem value="full-access" className="approval-mode-item">
+              <Shield size={16} />
+              <span>
+                <strong>{t("fullAccess")}</strong>
+                <small>{t("fullAccessHint")}</small>
+              </span>
+              <DropdownMenu.ItemIndicator className="item-indicator">
+                <Check size={14} />
+              </DropdownMenu.ItemIndicator>
+            </DropdownMenu.RadioItem>
+          </DropdownMenu.RadioGroup>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+export function CapabilityMenu({
   tools,
   knowledgeBases,
   skills,
@@ -3527,11 +3886,13 @@ function CapabilityMenu({
   nodes,
   state,
   onChange,
+  onOpen,
   t,
   count,
   skillPreflight,
   approvalMode,
   onApprovalModeChange,
+  disabled,
 }: {
   tools: Tool[];
   knowledgeBases: KnowledgeBase[];
@@ -3540,22 +3901,27 @@ function CapabilityMenu({
   nodes: NodeConnection[];
   state: CapabilityState;
   onChange: (state: CapabilityState) => void;
+  onOpen: () => void;
   t: (key: string) => string;
   count: number;
   skillPreflight: SkillPreflight | null;
   approvalMode: ApprovalMode;
   onApprovalModeChange: (mode: ApprovalMode) => void;
+  disabled: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [confirmingFullAccess, setConfirmingFullAccess] = useState(false);
   const toggle = (key: CapabilityArrayKey, id: string, checked: boolean) =>
-    onChange({
-      ...state,
-      [key]: checked
-        ? [...state[key], id]
-        : state[key].filter((item) => item !== id),
-    });
+    disabled
+      ? undefined
+      : onChange({
+          ...state,
+          [key]: checked
+            ? [...state[key], id]
+            : state[key].filter((item) => item !== id),
+        });
   const clearSelection = () =>
+    !disabled &&
     onChange({
       knowledgeBaseIds: [],
       skillIds: [],
@@ -3574,15 +3940,18 @@ function CapabilityMenu({
     nodes.length;
   return (
     <>
-    <DropdownMenu.Root>
+    <DropdownMenu.Root onOpenChange={(open) => { if (open) onOpen(); }}>
       <DropdownMenu.Trigger asChild>
         <button
           type="button"
           className="capability-button"
           aria-label={t("chooseCapability")}
+          disabled={disabled}
         >
-          <Zap size={14} />
-          <span className="capability-button-label">{t("chooseCapability")}</span>
+          <ShieldCheck size={16} />
+          <span className="capability-button-label">
+            {approvalMode === "full-access" ? t("fullAccess") : t("approvalOnRequest")}
+          </span>
           {count ? <span className="capability-count">{count}</span> : null}
           <ChevronDown size={12} />
         </button>
@@ -3598,7 +3967,7 @@ function CapabilityMenu({
               {t("capabilityTitle")}
             </DropdownMenu.Label>
             {count ? (
-              <button type="button" className="capability-clear" onClick={clearSelection}>
+              <button type="button" className="capability-clear" onClick={clearSelection} disabled={disabled}>
                 {t("clearSelection")}
               </button>
             ) : null}
@@ -3609,6 +3978,7 @@ function CapabilityMenu({
             <DropdownMenu.RadioGroup
               value={approvalMode}
               onValueChange={(value) => {
+                if (disabled) return;
                 if (value === "full-access" && approvalMode !== "full-access") {
                   setConfirmingFullAccess(true);
                   return;
@@ -3616,7 +3986,7 @@ function CapabilityMenu({
                 onApprovalModeChange(value as ApprovalMode);
               }}
             >
-              <DropdownMenu.RadioItem value="on-request" className="capability-item">
+              <DropdownMenu.RadioItem value="on-request" className="capability-item" disabled={disabled}>
                 <DropdownMenu.ItemIndicator className="item-indicator">
                   <Check size={13} />
                 </DropdownMenu.ItemIndicator>
@@ -3625,7 +3995,7 @@ function CapabilityMenu({
                   <small>{t("approvalOnRequestHint")}</small>
                 </span>
               </DropdownMenu.RadioItem>
-              <DropdownMenu.RadioItem value="full-access" className="capability-item">
+              <DropdownMenu.RadioItem value="full-access" className="capability-item" disabled={disabled}>
                 <DropdownMenu.ItemIndicator className="item-indicator">
                   <Check size={13} />
                 </DropdownMenu.ItemIndicator>
@@ -3655,6 +4025,7 @@ function CapabilityMenu({
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 onKeyDown={(event) => event.stopPropagation()}
+                disabled={disabled}
                 placeholder={t("searchCapabilities")}
               />
             </label>
@@ -3670,8 +4041,9 @@ function CapabilityMenu({
                 checked: state.knowledgeBaseIds.includes(base.id),
               }))}
               onToggle={toggle}
+              disabled={disabled}
             />
-          ) : null}
+            ) : null}
           {tools.filter((tool) => matches(tool.name, tool.description)).length ? (
             <CapabilityGroup
               title={t("builtInTools")}
@@ -3683,6 +4055,7 @@ function CapabilityMenu({
                 checked: state.toolNames.includes(tool.name),
               }))}
               onToggle={toggle}
+              disabled={disabled}
             />
           ) : null}
           {skills.filter((skill) => skill.enabled && matches(skill.name, skill.description)).length ? (
@@ -3698,6 +4071,7 @@ function CapabilityMenu({
                   checked: state.skillIds.includes(skill.id),
                 }))}
               onToggle={toggle}
+              disabled={disabled}
             />
           ) : null}
           {mcpConnections.filter((connection) => connection.enabled && matches(connection.name, connection.description ?? connection.status ?? "")).length ? (
@@ -3713,6 +4087,7 @@ function CapabilityMenu({
                   checked: state.mcpServerIds.includes(connection.id),
                 }))}
               onToggle={toggle}
+              disabled={disabled}
             />
           ) : null}
           {nodes.length ? (
@@ -3722,15 +4097,17 @@ function CapabilityMenu({
               </div>
               <DropdownMenu.RadioGroup
                 value={state.nodeId ?? ""}
-                onValueChange={(value) =>
-                  onChange({ ...state, nodeId: value || undefined })
-                }
+                onValueChange={(value) => {
+                  if (disabled) return;
+                  onChange({ ...state, nodeId: value || undefined });
+                }}
               >
                 {nodes.map((node) => (
                   <DropdownMenu.RadioItem
                     key={node.id}
                     value={node.id}
                     className="capability-item"
+                    disabled={disabled}
                   >
                     <DropdownMenu.ItemIndicator className="item-indicator">
                       <Check size={13} />
@@ -3801,6 +4178,7 @@ function CapabilityGroup({
   title,
   items,
   onToggle,
+  disabled,
 }: {
   title: string;
   items: {
@@ -3811,6 +4189,7 @@ function CapabilityGroup({
     checked: boolean;
   }[];
   onToggle: (key: CapabilityArrayKey, id: string, checked: boolean) => void;
+  disabled: boolean;
 }) {
   return (
     <div className="capability-group">
@@ -3820,6 +4199,7 @@ function CapabilityGroup({
           key={item.id}
           className="capability-item"
           checked={item.checked}
+          disabled={disabled}
           onCheckedChange={(checked) => onToggle(item.key, item.id, checked)}
         >
           <DropdownMenu.ItemIndicator className="item-indicator">
@@ -3860,6 +4240,8 @@ function ConfigurationWorkspace({
   const [compactNavigation, setCompactNavigation] = useState(
     () => window.matchMedia("(max-width: 1199px)").matches,
   );
+  const [agentEditorDirty, setAgentEditorDirty] = useState(false);
+  const [pendingConfigurationAction, setPendingConfigurationAction] = useState<{ type: "close" } | { type: "tab"; tab: string } | null>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
   const skillsQuery = useQuery({
     queryKey: ["skills"],
@@ -3885,7 +4267,7 @@ function ConfigurationWorkspace({
   const approvalsQuery = useQuery({
     queryKey: ["node-tool-approvals"],
     queryFn: studioApi.listNodeToolApprovals,
-    enabled: tab === "nodes",
+    enabled: tab === "nodes" && executionMode !== "PERSONAL_LOCAL",
     refetchInterval: tab === "nodes" ? 5_000 : false,
   });
   const toggleSkill = useMutation({
@@ -3936,8 +4318,36 @@ function ConfigurationWorkspace({
     { id: "mcp", icon: Globe2, label: t("mcp") },
     { id: "knowledge", icon: Database, label: t("knowledge") },
     { id: "models", icon: TerminalSquare, label: t("models") },
-    { id: "nodes", icon: HardDrive, label: t("nodes") },
+    {
+      id: "nodes",
+      icon: HardDrive,
+      label: executionMode === "PERSONAL_LOCAL" ? t("localExecutorCapabilities") : t("nodes"),
+      hintKey: executionMode === "PERSONAL_LOCAL" ? "localExecutorHint" : "nodesHint",
+    },
   ];
+  const requestClose = useCallback(() => {
+    if (tab === "agents" && agentEditorDirty) {
+      setPendingConfigurationAction({ type: "close" });
+      return;
+    }
+    onClose();
+  }, [agentEditorDirty, onClose, tab]);
+  const requestTabChange = useCallback((nextTab: string) => {
+    if (nextTab === tab) return;
+    if (tab === "agents" && agentEditorDirty) {
+      setPendingConfigurationAction({ type: "tab", tab: nextTab });
+      return;
+    }
+    setTab(nextTab);
+  }, [agentEditorDirty, setTab, tab]);
+  const discardConfigurationChanges = () => {
+    const action = pendingConfigurationAction;
+    setPendingConfigurationAction(null);
+    setAgentEditorDirty(false);
+    if (!action) return;
+    if (action.type === "close") onClose();
+    else setTab(action.tab);
+  };
   const submitKnowledge = form.handleSubmit((values) => {
     const parsed = knowledgeSchema.safeParse(values);
     if (parsed.success) createKnowledge.mutate(parsed.data);
@@ -3955,13 +4365,14 @@ function ConfigurationWorkspace({
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        if (event.defaultPrevented || (event.target instanceof Element && event.target.closest('[role="dialog"], [role="menu"]'))) return;
         event.preventDefault();
-        onClose();
+        requestClose();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+  }, [requestClose]);
   return (
     <section className="configuration-workspace" aria-labelledby="configuration-title">
           <header className="configuration-header">
@@ -3970,7 +4381,7 @@ function ConfigurationWorkspace({
               type="button"
               aria-label={t("workspace")}
               title={t("workspace")}
-              onClick={onClose}
+              onClick={requestClose}
             >
               <ArrowLeft size={17} />
               {t("workspace")}
@@ -3981,13 +4392,13 @@ function ConfigurationWorkspace({
               </h1>
               <p>{t("manageHint")}</p>
             </div>
-            <IconButton label={t("close")} onClick={onClose}>
+            <IconButton label={t("close")} onClick={requestClose}>
               <X size={18} />
             </IconButton>
           </header>
           <Tabs.Root
             value={tab}
-            onValueChange={setTab}
+            onValueChange={requestTabChange}
             orientation={compactNavigation ? "horizontal" : "vertical"}
             className="configuration-layout"
           >
@@ -4000,15 +4411,16 @@ function ConfigurationWorkspace({
               ))}
             </Tabs.List>
             <div className="configuration-panel">
-              {tabs.map(({ id, label }) => (
+              {tabs.map(({ id, label, hintKey }) => (
                 <Tabs.Content
                   value={id}
                   key={id}
-                  className="configuration-content"
+                  className={`configuration-content ${id === "agents" ? "configuration-content-agents" : ""}`}
                 >
                   <ManagerPanelHeading
                     label={label}
                     id={id}
+                    hintKey={hintKey}
                     t={t}
                     onAdd={
                       id === "knowledge"
@@ -4051,13 +4463,26 @@ function ConfigurationWorkspace({
                     knowledgeForm={form}
                     onKnowledgeSubmit={submitKnowledge}
                     knowledgeSubmitting={createKnowledge.isPending}
+                    onAgentDirtyChange={setAgentEditorDirty}
                     t={t}
                   />
                 </Tabs.Content>
               ))}
             </div>
           </Tabs.Root>
+          <ConfigurationUnsavedDialog open={Boolean(pendingConfigurationAction)} onOpenChange={(open) => { if (!open) setPendingConfigurationAction(null); }} onDiscard={discardConfigurationChanges} t={t} />
     </section>
+  );
+}
+
+function ConfigurationUnsavedDialog({ open, onOpenChange, onDiscard, t }: { open: boolean; onOpenChange: (open: boolean) => void; onDiscard: () => void; t: (key: string) => string }) {
+  return (
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal><Dialog.Overlay className="dialog-overlay" /><Dialog.Content className="utility-dialog agent-unsaved-dialog" aria-describedby="configuration-unsaved-description">
+        <div className="dialog-header"><div><Dialog.Title>{t("agentUnsavedTitle")}</Dialog.Title><Dialog.Description id="configuration-unsaved-description">{t("agentUnsavedHint")}</Dialog.Description></div><Dialog.Close asChild><button type="button" className="icon-button" aria-label={t("close")} title={t("close")}><X size={17} /></button></Dialog.Close></div>
+        <div className="inline-form-actions"><Dialog.Close asChild><button type="button" className="secondary-button">{t("agentKeepEditing")}</button></Dialog.Close><button type="button" className="danger-button" onClick={onDiscard}>{t("agentDiscardChanges")}</button></div>
+      </Dialog.Content></Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -4065,21 +4490,23 @@ function ManagerPanelHeading({
   label,
   id,
   t,
+  hintKey,
   onAdd,
   onRefresh,
 }: {
   label: string;
   id: string;
   t: (key: string) => string;
+  hintKey?: string;
   onAdd?: () => void;
   onRefresh: () => void;
 }) {
-  const hintKey = `${id}Hint`;
+  const resolvedHintKey = hintKey ?? `${id}Hint`;
   return (
     <div className="panel-heading">
       <div>
         <h3>{label}</h3>
-        <p>{t(hintKey)}</p>
+        <p>{t(resolvedHintKey)}</p>
       </div>
       {onAdd ? (
         <button type="button" className="secondary-button" onClick={onAdd}>
@@ -4119,6 +4546,7 @@ function ManagerPanelBody({
   knowledgeForm,
   onKnowledgeSubmit,
   knowledgeSubmitting,
+  onAgentDirtyChange,
   t,
 }: {
   id: string;
@@ -4148,33 +4576,54 @@ function ManagerPanelBody({
   >;
   onKnowledgeSubmit: () => void;
   knowledgeSubmitting: boolean;
+  onAgentDirtyChange: (dirty: boolean) => void;
   t: (key: string) => string;
 }) {
   if (id === "agents")
     return (
-      <AgentManager agents={agents} models={models} skills={skills ?? []} tools={tools} query={queries.agents} t={t} />
+      <Suspense fallback={<div className="manager-placeholder"><LoaderCircle size={18} className="spin" /></div>}>
+        <AgentManager agents={agents} models={models} skills={skills ?? []} tools={tools} query={queries.agents} t={t} onDirtyChange={onAgentDirtyChange} />
+      </Suspense>
     );
   if (id === "skills")
     return (
-      <SkillsManager
-        installed={skills ?? []}
-        query={queries.skills}
-        onToggle={onSkillToggle}
-        t={t}
-      />
+      <Suspense
+        fallback={
+          <div className="manager-placeholder">
+            <LoaderCircle size={18} className="spin" />
+            <span>{t("loading")}</span>
+          </div>
+        }
+      >
+        <SkillsManager
+          installed={skills ?? []}
+          query={queries.skills}
+          onToggle={onSkillToggle}
+          t={t}
+        />
+      </Suspense>
     );
   if (id === "mcp")
     return (
-      <McpManager
-        connections={mcpConnections ?? []}
-        query={queries.mcp}
-        onToggle={onMcpToggle}
-        onRefresh={onMcpRefresh}
-        refreshing={mcpRefreshing}
-        refreshingId={mcpRefreshingId}
-        refreshError={mcpRefreshError}
-        t={t}
-      />
+      <Suspense
+        fallback={
+          <div className="manager-placeholder">
+            <LoaderCircle size={18} className="spin" />
+            <span>{t("loading")}</span>
+          </div>
+        }
+      >
+        <McpManager
+          connections={mcpConnections ?? []}
+          query={queries.mcp}
+          onToggle={onMcpToggle}
+          onRefresh={onMcpRefresh}
+          refreshing={mcpRefreshing}
+          refreshingId={mcpRefreshingId}
+          refreshError={mcpRefreshError}
+          t={t}
+        />
+      </Suspense>
     );
   if (id === "knowledge")
     return (
@@ -4214,21 +4663,39 @@ function ManagerPanelBody({
             </div>
           </form>
         ) : null}
-        <KnowledgeManager
-          bases={knowledgeBases ?? []}
-          query={queries.knowledge}
-          t={t}
-        />
+        <Suspense
+          fallback={
+            <div className="manager-placeholder">
+              <LoaderCircle size={18} className="spin" />
+              <span>{t("loading")}</span>
+            </div>
+          }
+        >
+          <KnowledgeManager
+            bases={knowledgeBases ?? []}
+            query={queries.knowledge}
+            t={t}
+          />
+        </Suspense>
       </div>
     );
   if (id === "models")
     return (
-      <ModelManager
-        models={models}
-        onToggle={onModelToggle}
-        onSetDefault={onSetDefault}
-        t={t}
-      />
+      <Suspense
+        fallback={
+          <div className="manager-placeholder">
+            <LoaderCircle size={18} className="spin" />
+            <span>{t("loading")}</span>
+          </div>
+        }
+      >
+        <ModelManager
+          models={models}
+          onToggle={onModelToggle}
+          onSetDefault={onSetDefault}
+          t={t}
+        />
+      </Suspense>
     );
   return (
     <Suspense
@@ -4243,7 +4710,7 @@ function ManagerPanelBody({
         nodes={nodes ?? []}
         nodesQuery={queries.nodes}
         approvalsQuery={queries.approvals}
-        managedLocalExecutorAvailable={executionMode !== "NODES_ONLY"}
+        executionMode={executionMode}
         t={t}
       />
     </Suspense>
@@ -4252,3087 +4719,6 @@ function ManagerPanelBody({
 
 function isExternalToolName(name: string) {
   return name.startsWith("mcp:") || name.startsWith("mcp_") || name.startsWith("node:") || name.startsWith("node_");
-}
-
-type ModelFormValues = {
-  id: string;
-  providerType: "OPENAI_COMPATIBLE" | "OLLAMA";
-  baseUrl: string;
-  modelName: string;
-  credentialRef: string;
-  apiKey: string;
-  capabilities: ModelCapability[];
-  enabled: boolean;
-};
-
-const modelFormSchema = z.object({
-  id: z.string().trim().min(1),
-  providerType: z.enum(["OPENAI_COMPATIBLE", "OLLAMA"]),
-  baseUrl: z.string().trim().url(),
-  modelName: z.string().trim().min(1),
-  credentialRef: z.string().trim().optional(),
-  apiKey: z.string().optional(),
-  capabilities: z.array(z.string()).min(1),
-  enabled: z.boolean(),
-});
-
-const emptyModelForm: ModelFormValues = {
-  id: "",
-  providerType: "OPENAI_COMPATIBLE",
-  baseUrl: "https://api.openai.com/v1",
-  modelName: "",
-  credentialRef: "OPENAI_API_KEY",
-  apiKey: "",
-  capabilities: ["TEXT", "JSON_OUTPUT"],
-  enabled: true,
-};
-
-function ModelManager({
-  models,
-  onToggle,
-  onSetDefault,
-  t,
-}: {
-  models: ModelProfile[];
-  onToggle: (item: { id: string; enabled: boolean }) => void;
-  onSetDefault: (id: string) => void;
-  t: (key: string) => string;
-}) {
-  const queryClient = useQueryClient();
-  const [section, setSection] = useState("installed");
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
-  const [testResult, setTestResult] = useState<ModelTestResult | null>(null);
-  const [savedModelId, setSavedModelId] = useState<string | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<ModelProfile | null>(null);
-  const presetsQuery = useQuery({
-    queryKey: ["model-presets"],
-    queryFn: studioApi.listModelPresets,
-    enabled: section === "presets",
-  });
-  const form = useForm<ModelFormValues>({ defaultValues: emptyModelForm });
-  const saveMutation = useMutation({
-    mutationFn: studioApi.saveModel,
-    onSuccess: (model) => {
-      queryClient.invalidateQueries({ queryKey: ["models"] });
-      setEditorOpen(false);
-      setNotice(t("modelSaved"));
-      setSavedModelId(model.id);
-      setTestResult(null);
-      setError("");
-    },
-    onError: () => setError(t("modelSaveFailed")),
-  });
-  const deleteMutation = useMutation({
-    mutationFn: studioApi.deleteModel,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["models"] });
-      setDeleteTarget(null);
-      setNotice(t("delete"));
-      setError("");
-    },
-    onError: (failure) =>
-      setError(failure instanceof Error ? failure.message : t("loadFailed")),
-  });
-  const testMutation = useMutation({
-    mutationFn: (id: string) => studioApi.testModel(id),
-    onSuccess: (result) => {
-      setTestResult(result);
-      setError("");
-    },
-    onError: (failure) =>
-      setError(
-        failure instanceof Error && failure.message
-          ? failure.message
-          : t("modelTestFailed"),
-      ),
-  });
-  const capabilities = form.watch("capabilities");
-  const fieldError = (field: keyof ModelFormValues) =>
-    form.formState.errors[field] ? t("loadFailed") : null;
-  const capabilityOptions: { value: ModelCapability; label: string }[] = [
-    { value: "TEXT", label: t("capabilityText") },
-    { value: "VISION", label: t("capabilityVision") },
-    { value: "AUDIO_INPUT", label: t("capabilityAudio") },
-    { value: "TOOLS", label: t("capabilityTools") },
-    { value: "JSON_OUTPUT", label: t("capabilityJson") },
-    { value: "EMBEDDING", label: t("capabilityEmbedding") },
-  ];
-  const capabilityLabel = (value: string) =>
-    capabilityOptions.find((option) => option.value === value)?.label ?? value;
-  const openEditor = (model?: ModelProfile, preset?: ModelPreset) => {
-    const source = model ?? preset;
-    form.reset(
-      source
-        ? {
-            id: source.id,
-            providerType:
-              source.providerType === "OLLAMA" ? "OLLAMA" : "OPENAI_COMPATIBLE",
-            baseUrl: source.baseUrl,
-            modelName: source.modelName,
-            credentialRef: source.credentialRef,
-            apiKey: "",
-            capabilities: source.capabilities as ModelCapability[],
-            enabled: model?.enabled ?? true,
-          }
-        : emptyModelForm,
-    );
-    setEditingId(model?.id ?? null);
-    setEditorOpen(true);
-    setSavedModelId(null);
-    setTestResult(null);
-    setError("");
-  };
-  const submit = form.handleSubmit((values) => {
-    const parsed = modelFormSchema.safeParse(values);
-    if (!parsed.success) {
-      setError(t("loadFailed"));
-      return;
-    }
-    const { apiKey, ...model } = parsed.data;
-    saveMutation.mutate({
-      ...model,
-      ...(apiKey?.trim() ? { apiKey: apiKey.trim() } : {}),
-      capabilities: parsed.data.capabilities,
-    });
-  });
-  const removeModel = (model: ModelProfile) => {
-    if (model.defaultProfile) {
-      setError(t("modelDeleteDefaultHint"));
-      return;
-    }
-    setDeleteTarget(model);
-  };
-
-  return (
-    <div className="model-manager">
-      {deleteTarget ? (
-        <InlineDangerConfirm
-          title={`${t("deleteModel")} · ${deleteTarget.modelName}`}
-          description={t("modelDeleteHint")}
-          confirmLabel={t("deleteModel")}
-          busy={deleteMutation.isPending}
-          onCancel={() => setDeleteTarget(null)}
-          onConfirm={() => deleteMutation.mutate(deleteTarget.id)}
-        />
-      ) : null}
-      <div className="manager-subtabs" role="tablist">
-        <button
-          type="button"
-          role="tab"
-          aria-selected={section === "installed"}
-          className={section === "installed" ? "is-active" : ""}
-          onClick={() => {
-            setSection("installed");
-            setNotice("");
-            setError("");
-          }}
-        >
-          {t("modelInstalled")}
-        </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={section === "presets"}
-          className={section === "presets" ? "is-active" : ""}
-          onClick={() => {
-            setSection("presets");
-            setNotice("");
-            setError("");
-          }}
-        >
-          {t("modelPresets")}
-        </button>
-      </div>
-      {notice ? (
-        <div className="manager-notice success">
-          <CheckCircle2 size={14} />
-          {notice}
-          {savedModelId ? (
-            <button
-              type="button"
-              className="text-button model-save-notice-action"
-              disabled={testMutation.isPending}
-              onClick={() => testMutation.mutate(savedModelId)}
-            >
-              {testMutation.isPending ? (
-                <LoaderCircle size={14} className="spin" />
-              ) : (
-                <PlugZap size={14} />
-              )}
-              {t("testModel")}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      {error ? (
-        <div className="manager-notice error">
-          <CircleAlert size={14} />
-          {error}
-        </div>
-      ) : null}
-      {section === "installed" ? (
-        <div className="model-installed">
-          <div className="model-toolbar">
-            <span>
-              {models.length
-                ? `${models.length} ${t("models")}`
-                : t("modelEmpty")}
-            </span>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => openEditor()}
-            >
-              <Plus size={14} />
-              {t("addModel")}
-            </button>
-          </div>
-          {models.length ? (
-            <div className="model-profile-list">
-              {models.map((model) => (
-                <div className="model-profile-row" key={model.id}>
-                  <span className="model-glyph">
-                    <TerminalSquare size={15} />
-                  </span>
-                  <div className="model-profile-copy">
-                    <div className="model-profile-title">
-                      <strong>{model.modelName}</strong>
-                      {model.defaultProfile ? (
-                        <span className="default-mark">
-                          <CheckCircle2 size={13} />
-                          {t("default")}
-                        </span>
-                      ) : null}
-                    </div>
-                    <span>
-                      {model.providerType === "OLLAMA"
-                        ? t("ollama")
-                        : t("openaiCompatible")}{" "}
-                      · {model.baseUrl}
-                    </span>
-                    <div className="model-profile-meta">
-                      {model.capabilities.map((capability) => (
-                        <span className="capability-tag" key={capability}>
-                          {capabilityLabel(capability)}
-                        </span>
-                      ))}
-                      <span
-                        className={
-                          model.apiKeyConfigured
-                            ? "credential-state configured"
-                            : "credential-state"
-                        }
-                      >
-                        {model.apiKeyConfigured
-                          ? t("modelKeyConfigured")
-                          : t("modelNoKey")}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="model-profile-actions">
-                    <IconButton
-                      label={t("testModel")}
-                      onClick={() => testMutation.mutate(model.id)}
-                      disabled={testMutation.isPending}
-                    >
-                      <PlugZap size={14} />
-                    </IconButton>
-                    <IconButton
-                      label={t("editModel")}
-                      onClick={() => openEditor(model)}
-                    >
-                      <Pencil size={14} />
-                    </IconButton>
-                    {model.defaultProfile ? null : (
-                      <IconButton
-                        label={t("deleteModel")}
-                        onClick={() => removeModel(model)}
-                      >
-                        <Trash2 size={14} />
-                      </IconButton>
-                    )}{" "}
-                    {!model.defaultProfile ? (
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => onSetDefault(model.id)}
-                      >
-                        {t("setDefault")}
-                      </button>
-                    ) : null}
-                    <ToggleButton
-                      checked={model.enabled}
-                      onChange={(enabled) =>
-                        onToggle({ id: model.id, enabled })
-                      }
-                      label={model.enabled ? t("disable") : t("enable")}
-                    />
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : null}
-          {testResult ? (
-            <div
-              className={`model-test-result ${testResult.success ? "success" : "error"}`}
-            >
-              <div>
-                <strong>
-                  {testResult.success
-                    ? t("modelTestSuccess")
-                    : t("modelTestFailed")}
-                </strong>
-                <span>{testResult.message}</span>
-              </div>
-              {testResult.responsePreview ? (
-                <p>{testResult.responsePreview}</p>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-      ) : (
-        <div className="model-preset-list">
-          {presetsQuery.isLoading ? (
-            <div className="manager-placeholder">
-              <LoaderCircle size={18} className="spin" />
-              <span>{t("loading")}</span>
-            </div>
-          ) : presetsQuery.isError ? (
-            <div className="manager-placeholder">
-              <CircleAlert size={16} />
-              <span>{t("loadFailed")}</span>
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void presetsQuery.refetch()}
-              >
-                {t("retryLoad")}
-              </button>
-            </div>
-          ) : presetsQuery.data?.length ? (
-            presetsQuery.data.map((preset) => (
-              <div className="model-preset-row" key={preset.id}>
-                <div className="model-preset-copy">
-                  <strong>{preset.displayName}</strong>
-                  <span>
-                    {preset.providerName} · {preset.modelName}
-                  </span>
-                  <p>{preset.notes}</p>
-                  <div className="model-profile-meta">
-                    {preset.capabilities.map((capability) => (
-                      <span className="capability-tag" key={capability}>
-                        {capabilityLabel(capability)}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  className="secondary-button"
-                  onClick={() => openEditor(undefined, preset)}
-                >
-                  <Plus size={14} />
-                  {t("usePreset")}
-                </button>
-              </div>
-            ))
-          ) : (
-            <div className="manager-placeholder compact">
-              {t("modelPresetEmpty")}
-            </div>
-          )}
-        </div>
-      )}
-      {editorOpen ? (
-        <div className="model-editor">
-          <div className="model-editor-header">
-            <div>
-              <h4>{editingId ? t("editModel") : t("addModel")}</h4>
-              <p>{t("modelDetails")}</p>
-            </div>
-            <IconButton label={t("close")} onClick={() => setEditorOpen(false)}>
-              <X size={16} />
-            </IconButton>
-          </div>
-          <form
-            className="model-editor-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void submit();
-            }}
-          >
-            <div className="model-form-grid">
-              <label>
-                {t("modelId")}
-                <input {...form.register("id")} disabled={Boolean(editingId)} />
-                {fieldError("id") ? (
-                  <small className="form-error">{fieldError("id")}</small>
-                ) : null}
-              </label>
-              <label>
-                {t("providerType")}
-                <select {...form.register("providerType")}>
-                  <option value="OPENAI_COMPATIBLE">
-                    {t("openaiCompatible")}
-                  </option>
-                  <option value="OLLAMA">{t("ollama")}</option>
-                </select>
-              </label>
-              <label>
-                {t("baseUrl")}
-                <input
-                  {...form.register("baseUrl")}
-                  placeholder="https://api.openai.com/v1"
-                />
-                {fieldError("baseUrl") ? (
-                  <small className="form-error">{fieldError("baseUrl")}</small>
-                ) : null}
-              </label>
-              <label>
-                {t("modelName")}
-                <input {...form.register("modelName")} />
-                {fieldError("modelName") ? (
-                  <small className="form-error">
-                    {fieldError("modelName")}
-                  </small>
-                ) : null}
-              </label>
-              <label>
-                {t("apiKey")}
-                <input
-                  {...form.register("apiKey")}
-                  type="password"
-                  autoComplete="new-password"
-                  placeholder="sk-..."
-                />
-                <small className="form-note">{t("apiKeyHint")}</small>
-              </label>
-            </div>
-            <fieldset className="model-capability-fieldset">
-              <legend>{t("capabilities")}</legend>
-              <div className="model-capability-options">
-                {capabilityOptions.map((option) => (
-                  <label key={option.value} className="capability-check">
-                    <input
-                      type="checkbox"
-                      checked={capabilities.includes(option.value)}
-                      onChange={(event) =>
-                        form.setValue(
-                          "capabilities",
-                          event.target.checked
-                            ? [...capabilities, option.value]
-                            : capabilities.filter(
-                                (value) => value !== option.value,
-                              ),
-                          { shouldValidate: true },
-                        )
-                      }
-                    />
-                    <span>{option.label}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
-            <label className="model-enabled-check">
-              <input type="checkbox" {...form.register("enabled")} />
-              {t("modelEnabled")}
-            </label>
-            <div className="inline-form-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setEditorOpen(false)}
-              >
-                {t("cancel")}
-              </button>
-              <button
-                type="submit"
-                className="primary-button"
-                disabled={saveMutation.isPending}
-              >
-                {saveMutation.isPending ? (
-                  <LoaderCircle size={14} className="spin" />
-                ) : (
-                  <Check size={14} />
-                )}
-                {saveMutation.isPending ? t("modelSaving") : t("modelSave")}
-              </button>
-            </div>
-          </form>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-const knowledgeSettingsSchema = z
-  .object({
-    embeddingEnabled: z.boolean(),
-    embeddingModel: z.string().trim(),
-    embeddingBaseUrl: z.string().trim(),
-    embeddingCredentialEnv: z.string().trim(),
-    apiKey: z.string(),
-    vectorStore: z.string().trim(),
-    chunkSize: z.coerce.number().int().min(1).max(16_384),
-    chunkOverlap: z.coerce.number().int().min(0).max(8_192),
-  })
-  .superRefine((values, context) => {
-    if (!values.embeddingEnabled) return;
-    if (!values.embeddingModel) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["embeddingModel"] });
-    }
-    if (!/^https?:\/\//i.test(values.embeddingBaseUrl)) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["embeddingBaseUrl"] });
-    }
-    if (!values.vectorStore) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["vectorStore"] });
-    }
-    if (values.chunkOverlap >= values.chunkSize) {
-      context.addIssue({ code: z.ZodIssueCode.custom, path: ["chunkOverlap"] });
-    }
-  });
-
-type KnowledgeSettingsForm = z.infer<typeof knowledgeSettingsSchema>;
-
-const defaultKnowledgeSettingsForm: KnowledgeSettingsForm = {
-  embeddingEnabled: true,
-  embeddingModel: "",
-  embeddingBaseUrl: "",
-  embeddingCredentialEnv: "",
-  apiKey: "",
-  vectorStore: "local",
-  chunkSize: 800,
-  chunkOverlap: 120,
-};
-
-function KnowledgeManager({
-  bases,
-  query,
-  t,
-}: {
-  bases: KnowledgeBase[];
-  query: ResourceQuery;
-  t: (key: string) => string;
-}) {
-  const queryClient = useQueryClient();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [textOpen, setTextOpen] = useState(false);
-  const [sourceName, setSourceName] = useState("");
-  const [content, setContent] = useState("");
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
-  const [editingBase, setEditingBase] = useState(false);
-  const [clearDocumentsConfirmation, setClearDocumentsConfirmation] =
-    useState(false);
-  const [nameDraft, setNameDraft] = useState("");
-  const [descriptionDraft, setDescriptionDraft] = useState("");
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchText, setSearchText] = useState("");
-  const [settingsEditing, setSettingsEditing] = useState(false);
-  const [expandedDocumentId, setExpandedDocumentId] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const settingsForm = useForm<KnowledgeSettingsForm>({
-    defaultValues: defaultKnowledgeSettingsForm,
-  });
-  const settingsQuery = useQuery({
-    queryKey: ["knowledge-settings"],
-    queryFn: studioApi.getKnowledgeSettings,
-    staleTime: 60_000,
-  });
-  const updateSettings = useMutation({
-    mutationFn: (values: KnowledgeSettingsForm) => {
-      const payload: KnowledgeSettingsUpdate = {
-        embeddingEnabled: values.embeddingEnabled,
-        embeddingModel: values.embeddingModel.trim(),
-        embeddingBaseUrl: values.embeddingBaseUrl.trim(),
-        embeddingCredentialEnv: values.embeddingCredentialEnv.trim() || undefined,
-        apiKey: values.apiKey.trim() || undefined,
-        vectorStore: values.vectorStore.trim(),
-        chunkSize: values.chunkSize,
-        chunkOverlap: values.chunkOverlap,
-      };
-      return studioApi.updateKnowledgeSettings(payload);
-    },
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["knowledge-settings"] });
-      setSettingsEditing(false);
-      setNotice(t("completed"));
-      setError("");
-    },
-    onError: (failure) => {
-      setError(failure instanceof Error && failure.message ? failure.message : t("knowledgeActionFailed"));
-    },
-  });
-  const selectedBaseFromList = bases.find((base) => base.id === selectedId);
-  const detailQuery = useQuery({
-    queryKey: ["knowledge-base", selectedId],
-    queryFn: () => studioApi.getKnowledgeBase(selectedId!),
-    enabled: Boolean(selectedId),
-  });
-  const selectedBase = detailQuery.data?.summary ?? selectedBaseFromList;
-  const statsQuery = useQuery({
-    queryKey: ["knowledge-stats", selectedId],
-    queryFn: () => studioApi.getKnowledgeStats(selectedId!),
-    enabled: Boolean(selectedId),
-  });
-  const chunksQuery = useQuery({
-    queryKey: ["knowledge-chunks", selectedId, expandedDocumentId],
-    queryFn: () => studioApi.listKnowledgeChunks(selectedId!, expandedDocumentId!),
-    enabled: Boolean(selectedId && expandedDocumentId),
-  });
-  const searchMutation = useMutation({
-    mutationFn: (query: string) =>
-      studioApi.searchKnowledge({
-        knowledgeBaseIds: [selectedId!],
-        query,
-        limit: 8,
-      }),
-    onSuccess: () => setError(""),
-    onError: (failure) =>
-      setError(failure instanceof Error && failure.message ? failure.message : t("knowledgeSearchFailed")),
-  });
-  const refresh = async () => {
-    await queryClient.refetchQueries({ queryKey: ["knowledge-bases"] });
-    if (selectedId) {
-      await queryClient.refetchQueries({
-        queryKey: ["knowledge-base", selectedId],
-      });
-      await queryClient.refetchQueries({ queryKey: ["knowledge-stats", selectedId] });
-    }
-  };
-  const showSuccess = (duplicate = false) => {
-    setNotice(duplicate ? t("knowledgeDuplicate") : t("knowledgeImported"));
-    setError("");
-    setTextOpen(false);
-    setSourceName("");
-    setContent("");
-    refresh();
-  };
-  const ingestText = useMutation({
-    mutationFn: () =>
-      studioApi.ingestKnowledgeDocument(selectedId!, {
-        sourceName: sourceName.trim(),
-        content,
-      }),
-    onSuccess: (result) => showSuccess(result.duplicate),
-    onError: (error) =>
-      setError(error instanceof Error && error.message ? error.message : t("knowledgeImportFailed")),
-  });
-  const uploadFile = useMutation({
-    mutationFn: (files: File[]) =>
-      studioApi.uploadKnowledgeDocuments(selectedId!, files),
-    onSuccess: (result) => {
-      const imported = result.files.filter(
-        (file) => file.succeeded && !file.duplicate,
-      ).length;
-      const duplicates = result.files.filter(
-        (file) => file.succeeded && file.duplicate,
-      ).length;
-      const failed = result.files.filter((file) => !file.succeeded);
-      setNotice(
-        `${t("knowledgeImportResults")}: ${imported} ${t("knowledgeImportedCount")}, ${duplicates} ${t("knowledgeSkippedCount")}, ${failed.length} ${t("knowledgeFailedCount")}`,
-      );
-      setError(
-        failed.length
-          ? failed.map((file) => `${file.sourceName}: ${file.error}`).join("\n")
-          : "",
-      );
-      setTextOpen(false);
-      refresh();
-    },
-    onError: (error) =>
-      setError(error instanceof Error && error.message ? error.message : t("knowledgeImportFailed")),
-  });
-  const deleteDocument = useMutation({
-    mutationFn: (documentId: string) =>
-      studioApi.deleteKnowledgeDocument(selectedId!, documentId),
-    onSuccess: refresh,
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const deleteBase = useMutation({
-    mutationFn: studioApi.deleteKnowledgeBase,
-    onSuccess: refresh,
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const updateBase = useMutation({
-    mutationFn: ({ id, name, description }: { id: string; name: string; description: string }) =>
-      studioApi.updateKnowledgeBase(id, { name, description: description || undefined }),
-    onSuccess: () => {
-      setEditingBase(false);
-      setNotice(t("knowledgeSaved"));
-      setError("");
-      refresh();
-    },
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const clearDocuments = useMutation({
-    mutationFn: () => studioApi.clearKnowledgeDocuments(selectedId!),
-    onSuccess: () => {
-      setClearDocumentsConfirmation(false);
-      setNotice(t("completed"));
-      setError("");
-      refresh();
-    },
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const rebuildDocument = useMutation({
-    mutationFn: (documentId: string) =>
-      studioApi.rebuildKnowledgeDocument(selectedId!, documentId),
-    onSuccess: refresh,
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const rebuildBase = useMutation({
-    mutationFn: () => studioApi.rebuildKnowledgeBase(selectedId!),
-    onSuccess: refresh,
-    onError: () => setError(t("knowledgeActionFailed")),
-  });
-  const busy =
-    ingestText.isPending ||
-    uploadFile.isPending ||
-    deleteDocument.isPending ||
-    rebuildDocument.isPending ||
-    rebuildBase.isPending ||
-    updateBase.isPending ||
-    clearDocuments.isPending;
-
-  useEffect(() => {
-    if (selectedId && !bases.some((base) => base.id === selectedId))
-      setSelectedId(null);
-  }, [bases, selectedId]);
-
-  const openBase = (id: string) => {
-    const base = bases.find((item) => item.id === id);
-    setSelectedId(id);
-    setNotice("");
-    setError("");
-    setTextOpen(false);
-    setEditingBase(false);
-    setClearDocumentsConfirmation(false);
-    setSearchOpen(false);
-    setSearchText("");
-    setExpandedDocumentId(null);
-    setNameDraft(base?.name ?? "");
-    setDescriptionDraft(base?.description ?? "");
-  };
-  const closeBase = () => {
-    setSelectedId(null);
-    setNotice("");
-    setError("");
-    setTextOpen(false);
-    setEditingBase(false);
-    setClearDocumentsConfirmation(false);
-    setSearchOpen(false);
-    setSearchText("");
-    setExpandedDocumentId(null);
-  };
-  const handleFiles = (files: File[]) => {
-    if (files.length && selectedId) uploadFile.mutate(files);
-  };
-  const documents = detailQuery.data?.documents ?? [];
-  const selectedStats = statsQuery.data ?? {
-    knowledgeBaseId: selectedBase?.id ?? "",
-    documentCount: selectedBase?.documentCount ?? 0,
-    chunkCount: selectedBase?.chunkCount ?? 0,
-  };
-  const openSettingsEditor = () => {
-    const settings = settingsQuery.data;
-    settingsForm.reset({
-      embeddingEnabled: settings?.embeddingEnabled ?? true,
-      embeddingModel: settings?.embeddingModel ?? "",
-      embeddingBaseUrl: settings?.embeddingBaseUrl ?? "",
-      embeddingCredentialEnv: settings?.embeddingCredentialEnv ?? "",
-      apiKey: "",
-      vectorStore: settings?.vectorStore ?? defaultKnowledgeSettingsForm.vectorStore,
-      chunkSize: settings?.chunkSize ?? defaultKnowledgeSettingsForm.chunkSize,
-      chunkOverlap: settings?.chunkOverlap ?? defaultKnowledgeSettingsForm.chunkOverlap,
-    });
-    setSettingsEditing(true);
-    setError("");
-  };
-  const settingsSubmit = settingsForm.handleSubmit((values) => {
-    const parsed = knowledgeSettingsSchema.safeParse(values);
-    if (!parsed.success) {
-      setError(t("knowledgeActionFailed"));
-      return;
-    }
-    updateSettings.mutate(parsed.data);
-  });
-
-  if (selectedBase)
-    return (
-      <div className="knowledge-detail">
-        <button
-          type="button"
-          className="text-button back-button"
-          onClick={closeBase}
-        >
-          <ArrowLeft size={14} />
-          {t("backToKnowledgeBases")}
-        </button>
-        <div className="knowledge-detail-heading">
-          <div>
-            <h4>{selectedBase.name}</h4>
-            <p>{selectedBase.description || t("noDescription")}</p>
-          </div>
-          <div className="knowledge-detail-actions">
-            <input
-              ref={fileInputRef}
-              type="file"
-              hidden
-              multiple
-              accept=".pdf,.docx,.xlsx,.pptx,.txt,.md,.markdown,.csv,.tsv,.json,.html,.htm,.xml,.yml,.yaml,.log,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-              onChange={(event) => {
-                handleFiles(Array.from(event.target.files ?? []));
-                event.currentTarget.value = "";
-              }}
-            />
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={busy}
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload size={14} />
-              {uploadFile.isPending ? t("importing") : t("importFile")}
-            </button>
-            <button
-              type="button"
-              className={
-                textOpen ? "secondary-button is-active" : "secondary-button"
-              }
-              disabled={busy}
-              onClick={() => {
-                setTextOpen((current) => !current);
-                setError("");
-              }}
-            >
-              <FileText size={14} />
-              {t("importText")}
-            </button>
-            <button
-              type="button"
-              className={
-                searchOpen ? "secondary-button is-active" : "secondary-button"
-              }
-              disabled={busy}
-              onClick={() => {
-                setSearchOpen((current) => !current);
-                setError("");
-              }}
-            >
-              <Search size={14} />
-              {t("testRetrieval")}
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={busy}
-              onClick={() => rebuildBase.mutate()}
-            >
-              <RefreshCw size={14} />
-              {t("rebuildIndex")}
-            </button>
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={busy}
-              onClick={() => setEditingBase((current) => !current)}
-            >
-              <Pencil size={14} />
-              {t("editKnowledge")}
-            </button>
-            <button
-              type="button"
-              className="secondary-button danger-text-button"
-              disabled={busy || documents.length === 0}
-              onClick={() => setClearDocumentsConfirmation(true)}
-            >
-              <Trash2 size={14} />
-              {t("clearDocuments")}
-            </button>
-          </div>
-        </div>
-        <KnowledgeRuntimeSummary
-          settings={settingsQuery.data}
-          settingsLoading={settingsQuery.isLoading}
-          settingsError={settingsQuery.isError}
-          stats={selectedStats}
-          statsLoading={statsQuery.isLoading}
-          onConfigure={openSettingsEditor}
-          t={t}
-        />
-        {settingsEditing ? (
-          <KnowledgeSettingsEditor
-            form={settingsForm}
-            saving={updateSettings.isPending}
-            onCancel={() => setSettingsEditing(false)}
-            onSubmit={settingsSubmit}
-            t={t}
-          />
-        ) : null}
-        {notice ? (
-          <div className="manager-notice success">
-            <CheckCircle2 size={14} />
-            {notice}
-          </div>
-        ) : null}
-        {error ? (
-          <div className="manager-notice error">
-            <CircleAlert size={14} />
-            {error}
-          </div>
-        ) : null}
-        {searchOpen ? (
-          <form
-            className="inline-form knowledge-search-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (searchText.trim()) searchMutation.mutate(searchText.trim());
-            }}
-          >
-            <label>
-              {t("retrievalQuery")}
-              <input
-                value={searchText}
-                onChange={(event) => setSearchText(event.target.value)}
-                placeholder={t("retrievalQueryPlaceholder")}
-                autoFocus
-              />
-            </label>
-            <div className="inline-form-actions">
-              <span className="form-note">{t("retrievalQueryHint")}</span>
-              <button
-                type="submit"
-                className="primary-button"
-                disabled={!searchText.trim() || searchMutation.isPending}
-              >
-                {searchMutation.isPending ? (
-                  <LoaderCircle size={14} className="spin" />
-                ) : (
-                  <Search size={14} />
-                )}
-                {t("search")}
-              </button>
-            </div>
-            {searchMutation.data?.length ? (
-              <div className="knowledge-search-results">
-                {searchMutation.data.map((result) => (
-                  <KnowledgeSearchResultRow
-                    key={`${result.documentId}-${result.chunkIndex}`}
-                    result={result}
-                    t={t}
-                  />
-                ))}
-              </div>
-            ) : searchMutation.isSuccess ? (
-              <div className="manager-placeholder compact">{t("noKnowledgeSearchResults")}</div>
-            ) : null}
-          </form>
-        ) : null}
-        {editingBase ? (
-          <form
-            className="inline-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (nameDraft.trim()) {
-                updateBase.mutate({
-                  id: selectedBase.id,
-                  name: nameDraft.trim(),
-                  description: descriptionDraft.trim(),
-                });
-              }
-            }}
-          >
-            <label>
-              {t("knowledgeName")}
-              <input
-                value={nameDraft}
-                autoFocus
-                onChange={(event) => setNameDraft(event.target.value)}
-              />
-            </label>
-            <label>
-              {t("knowledgeDescription")}
-              <textarea
-                value={descriptionDraft}
-                rows={2}
-                onChange={(event) => setDescriptionDraft(event.target.value)}
-              />
-            </label>
-            <div className="inline-form-actions">
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => setEditingBase(false)}
-              >
-                {t("cancel")}
-              </button>
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={!nameDraft.trim() || updateBase.isPending}
-              >
-                {updateBase.isPending ? (
-                  <LoaderCircle size={14} className="spin" />
-                ) : (
-                  <Check size={14} />
-                )}
-                {t("saveKnowledge")}
-              </button>
-            </div>
-          </form>
-        ) : null}
-        {clearDocumentsConfirmation ? (
-          <InlineDangerConfirm
-            title={`${t("clearDocuments")} · ${selectedBase.name}`}
-            description={t("clearDocumentsHint")}
-            confirmLabel={t("clearDocuments")}
-            busy={clearDocuments.isPending}
-            onCancel={() => setClearDocumentsConfirmation(false)}
-            onConfirm={() => clearDocuments.mutate()}
-          />
-        ) : null}
-        {textOpen ? (
-          <form
-            className="inline-form knowledge-import-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              if (sourceName.trim() && content.trim()) ingestText.mutate();
-            }}
-          >
-            <label>
-              {t("sourceName")}
-              <input
-                value={sourceName}
-                onChange={(event) => setSourceName(event.target.value)}
-                placeholder={t("sourceNamePlaceholder")}
-                autoFocus
-              />
-            </label>
-            <label>
-              {t("documentContent")}
-              <textarea
-                value={content}
-                onChange={(event) => setContent(event.target.value)}
-                rows={7}
-                placeholder={t("documentContentPlaceholder")}
-              />
-            </label>
-            <div className="inline-form-actions">
-              <span className="form-note">
-                {content.length.toLocaleString()} {t("characters")}
-              </span>
-              <button
-                type="submit"
-                className="primary-button"
-                disabled={
-                  !sourceName.trim() || !content.trim() || ingestText.isPending
-                }
-              >
-                <Upload size={14} />
-                {ingestText.isPending ? t("importing") : t("startImport")}
-              </button>
-            </div>
-          </form>
-        ) : null}
-        <div className="knowledge-documents-heading">
-          <div>
-            <strong>{t("documents")}</strong>
-            <span>
-              {detailQuery.isLoading
-                ? t("loading")
-                : `${selectedStats.documentCount} ${t("documentCount")} · ${selectedStats.chunkCount} ${t("chunkCount")}`}
-            </span>
-          </div>
-        </div>
-        {detailQuery.isError ? (
-          <div className="manager-placeholder compact">
-            <CircleAlert size={16} />
-            <span>{t("loadFailed")}</span>
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => void detailQuery.refetch()}
-            >
-              {t("retryLoad")}
-            </button>
-          </div>
-        ) : detailQuery.isLoading ? (
-          <div className="manager-placeholder compact">
-            <LoaderCircle size={18} className="spin" />
-            <span>{t("loading")}</span>
-          </div>
-        ) : documents.length ? (
-          <div className="knowledge-document-list">
-            {documents.map((document) => (
-              <KnowledgeDocumentRow
-                key={document.id}
-                document={document}
-                busy={busy}
-                onDelete={() => deleteDocument.mutate(document.id)}
-                onRebuild={() => rebuildDocument.mutate(document.id)}
-                chunksOpen={expandedDocumentId === document.id}
-                chunks={expandedDocumentId === document.id ? chunksQuery.data ?? [] : []}
-                chunksLoading={expandedDocumentId === document.id && chunksQuery.isLoading}
-                chunksError={expandedDocumentId === document.id && chunksQuery.isError}
-                onToggleChunks={() =>
-                  setExpandedDocumentId((current) =>
-                    current === document.id ? null : document.id,
-                  )
-                }
-                t={t}
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="manager-placeholder compact">
-            <FileText size={16} />
-            <span>{t("noDocuments")}</span>
-          </div>
-        )}
-      </div>
-    );
-
-  return (
-    <div className="knowledge-list-view">
-      <KnowledgeRuntimeSummary
-        settings={settingsQuery.data}
-        settingsLoading={settingsQuery.isLoading}
-        settingsError={settingsQuery.isError}
-        onConfigure={openSettingsEditor}
-        t={t}
-      />
-      {settingsEditing ? (
-        <KnowledgeSettingsEditor
-          form={settingsForm}
-          saving={updateSettings.isPending}
-          onCancel={() => setSettingsEditing(false)}
-          onSubmit={settingsSubmit}
-          t={t}
-        />
-      ) : null}
-      <QueryResourceState query={query} t={t}>
-      {bases.map((base) => (
-        <ResourceRow
-          key={base.id}
-          icon={<Database size={15} />}
-          title={base.name}
-          detail={base.description || t("noDescription")}
-          status={`${base.documentCount} ${t("documentCount")} · ${base.chunkCount} ${t("chunkCount")}`}
-          trailing={
-            <span className="row-actions">
-              <button
-                type="button"
-                className="text-button"
-                onClick={() => openBase(base.id)}
-              >
-                {t("openKnowledge")}
-              </button>
-              <ConfirmDeleteButton
-                name={base.name}
-                description={t("deleteKnowledgeHint")}
-                busy={deleteBase.isPending}
-                onConfirm={() => deleteBase.mutate(base.id)}
-              />
-            </span>
-          }
-        />
-      ))}
-      </QueryResourceState>
-    </div>
-  );
-}
-
-function KnowledgeRuntimeSummary({
-  settings,
-  settingsLoading,
-  settingsError,
-  stats,
-  statsLoading,
-  onConfigure,
-  t,
-}: {
-  settings?: KnowledgeSettings;
-  settingsLoading: boolean;
-  settingsError: boolean;
-  stats?: { documentCount: number; chunkCount: number };
-  statsLoading?: boolean;
-  onConfigure?: () => void;
-  t: (key: string) => string;
-}) {
-  const embeddingReady = settings?.embeddingEnabled === true && settings.embeddingCredentialConfigured === true;
-  return (
-    <section className="knowledge-runtime-summary" aria-label={t("knowledgeRuntime") }>
-      <div className="knowledge-runtime-heading">
-        <div>
-          <strong>{t("knowledgeRuntime")}</strong>
-          <span>{t("knowledgeRuntimeHint")}</span>
-        </div>
-        <div className="knowledge-runtime-actions">
-          <span className={`knowledge-runtime-status ${embeddingReady ? "ready" : "warning"}`}>
-            {settingsLoading ? t("loading") : settingsError ? t("loadFailed") : embeddingReady ? t("embeddingReady") : t("embeddingNotConfigured")}
-          </span>
-          {onConfigure ? (
-            <button type="button" className="text-button" onClick={onConfigure} disabled={settingsLoading}>
-              <Pencil size={14} />
-              {t("configureEmbedding")}
-            </button>
-          ) : null}
-        </div>
-      </div>
-      {settings ? (
-        <div className="knowledge-runtime-grid">
-          <div><span>{t("embeddingModel")}</span><strong>{settings.embeddingModel || "-"}</strong></div>
-          <div><span>{t("vectorStore")}</span><strong>{settings.vectorStore || "-"}</strong></div>
-          <div><span>{t("chunking")}</span><strong>{settings.chunkSize} / {settings.chunkOverlap}</strong></div>
-          <div><span>{t("embeddingEndpoint")}</span><strong>{settings.embeddingBaseUrl || "-"}</strong></div>
-          <div><span>{t("credentialVariable")}</span><strong>{settings.embeddingCredentialEnv || "-"}</strong></div>
-          {stats ? <div><span>{t("knowledgeStats")}</span><strong>{statsLoading ? t("loading") : `${stats.documentCount} ${t("documentCount")} · ${stats.chunkCount} ${t("chunkCount")}`}</strong></div> : null}
-        </div>
-      ) : settingsLoading ? (
-        <div className="manager-placeholder compact"><LoaderCircle size={15} className="spin" />{t("loading")}</div>
-      ) : null}
-    </section>
-  );
-}
-
-function KnowledgeSettingsEditor({
-  form,
-  saving,
-  onCancel,
-  onSubmit,
-  t,
-}: {
-  form: ReturnType<typeof useForm<KnowledgeSettingsForm>>;
-  saving: boolean;
-  onCancel: () => void;
-  onSubmit: () => void;
-  t: (key: string) => string;
-}) {
-  const embeddingEnabled = form.watch("embeddingEnabled");
-  const fieldError = (field: keyof KnowledgeSettingsForm) =>
-    form.formState.errors[field] ? t("loadFailed") : null;
-  return (
-    <form
-      className="inline-form knowledge-settings-form"
-      onSubmit={(event) => {
-        event.preventDefault();
-        onSubmit();
-      }}
-    >
-      <div className="knowledge-settings-heading">
-        <div>
-          <strong>{t("configureEmbedding")}</strong>
-          <span>{t("knowledgeRuntimeHint")}</span>
-        </div>
-        <label className="model-enabled-check">
-          <input type="checkbox" {...form.register("embeddingEnabled")} />
-          {embeddingEnabled ? t("enabled") : t("disabled")}
-        </label>
-      </div>
-      <div className="model-form-grid">
-        <label>
-          {t("embeddingModel")}
-          <input {...form.register("embeddingModel")} disabled={!embeddingEnabled} placeholder="text-embedding-3-small" />
-          {fieldError("embeddingModel") ? <small className="form-error">{fieldError("embeddingModel")}</small> : null}
-        </label>
-        <label>
-          {t("embeddingEndpoint")}
-          <input {...form.register("embeddingBaseUrl")} disabled={!embeddingEnabled} placeholder="https://api.openai.com/v1" />
-          {fieldError("embeddingBaseUrl") ? <small className="form-error">{fieldError("embeddingBaseUrl")}</small> : null}
-        </label>
-        <label>
-          {t("apiKey")}
-          <input {...form.register("apiKey")} type="password" autoComplete="new-password" disabled={!embeddingEnabled} placeholder="sk-..." />
-          <small className="form-note">{t("embeddingApiKeyHint")}</small>
-        </label>
-        <label>
-          {t("credentialVariable")}
-          <input {...form.register("embeddingCredentialEnv")} disabled={!embeddingEnabled} placeholder="OPENAI_API_KEY" />
-        </label>
-        <label>
-          {t("vectorStore")}
-          <input {...form.register("vectorStore")} disabled={!embeddingEnabled} placeholder="local" />
-          {fieldError("vectorStore") ? <small className="form-error">{fieldError("vectorStore")}</small> : null}
-        </label>
-        <label>
-          {t("chunking")}
-          <span className="knowledge-chunk-inputs">
-            <span><small>{t("chunkSize")}</small><input type="number" min="1" {...form.register("chunkSize", { valueAsNumber: true })} disabled={!embeddingEnabled} aria-label={t("chunkSize")} /></span>
-            <span><small>{t("chunkOverlap")}</small><input type="number" min="0" {...form.register("chunkOverlap", { valueAsNumber: true })} disabled={!embeddingEnabled} aria-label={t("chunkOverlap")} /></span>
-          </span>
-          {fieldError("chunkSize") || fieldError("chunkOverlap") ? <small className="form-error">{t("loadFailed")}</small> : null}
-        </label>
-      </div>
-      <div className="inline-form-actions">
-        <button type="button" className="secondary-button" disabled={saving} onClick={onCancel}>{t("cancel")}</button>
-        <button type="submit" className="primary-button" disabled={saving}>
-          {saving ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
-          {t("save")}
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function KnowledgeSearchResultRow({
-  result,
-  t,
-}: {
-  result: KnowledgeSearchResult;
-  t: (key: string) => string;
-}) {
-  return (
-    <div className="knowledge-search-result">
-      <div>
-        <strong>{result.sourceName} · {t("chunkCount")} {result.chunkIndex + 1}</strong>
-        <span>{t("retrievalScore")}: {Number.isFinite(result.score) ? result.score.toFixed(3) : "-"}</span>
-      </div>
-      <p>{result.content}</p>
-    </div>
-  );
-}
-
-function KnowledgeDocumentRow({
-  document,
-  busy,
-  onDelete,
-  onRebuild,
-  chunksOpen,
-  chunks,
-  chunksLoading,
-  chunksError,
-  onToggleChunks,
-  t,
-}: {
-  document: KnowledgeDocument;
-  busy: boolean;
-  onDelete: () => void;
-  onRebuild: () => void;
-  chunksOpen: boolean;
-  chunks: KnowledgeChunk[];
-  chunksLoading: boolean;
-  chunksError: boolean;
-  onToggleChunks: () => void;
-  t: (key: string) => string;
-}) {
-  const indexStatus = document.indexStatus ?? "READY";
-  const indexLabel =
-    indexStatus === "FAILED"
-      ? t("indexFailed")
-      : indexStatus === "INDEXING"
-        ? t("indexing")
-        : t("indexReady");
-  return (
-    <div className="knowledge-document-shell">
-      <div className="knowledge-document-row">
-      <div className="model-glyph">
-        <FileText size={15} />
-      </div>
-      <div className="knowledge-document-copy">
-        <strong>{document.sourceName}</strong>
-        <span>
-          {document.contentType || "text/plain"} ·{" "}
-          {formatFileSize(document.contentLength)} · {document.chunkCount}{" "}
-          {t("chunkCount")}
-        </span>
-        <span className="knowledge-document-index">
-          <span className={`document-index-status ${indexStatus.toLowerCase()}`}>
-            {indexLabel}
-          </span>
-          {document.indexDurationMs !== null && document.indexDurationMs !== undefined ? (
-            <span>
-              {t("indexDuration")} {formatDuration(document.indexDurationMs)}
-            </span>
-          ) : null}
-        </span>
-        {document.summary ? <p>{document.summary}</p> : null}
-        {indexStatus === "FAILED" && document.indexError ? (
-          <p className="knowledge-document-error">{document.indexError}</p>
-        ) : null}
-      </div>
-      <div className="row-actions">
-        <IconButton label={chunksOpen ? t("hideChunks") : t("viewChunks")} onClick={onToggleChunks}>
-          {chunksOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </IconButton>
-        {document.rebuildable ? (
-          <IconButton label={t("rebuildIndex")} onClick={onRebuild}>
-            {busy ? (
-              <LoaderCircle size={14} className="spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-          </IconButton>
-        ) : null}
-        <ConfirmDeleteButton
-          name={document.sourceName}
-          description={t("deleteDocumentHint")}
-          busy={busy}
-          onConfirm={onDelete}
-        />
-      </div>
-      </div>
-      {chunksOpen ? (
-        <div className="knowledge-chunk-list">
-        {chunksLoading ? (
-          <div className="manager-placeholder compact">
-            <LoaderCircle size={15} className="spin" />
-            <span>{t("loading")}</span>
-          </div>
-        ) : chunksError ? (
-          <div className="manager-placeholder compact">
-            <CircleAlert size={15} />
-            <span>{t("chunksLoadFailed")}</span>
-          </div>
-        ) : chunks.length ? (
-          chunks.map((chunk) => (
-            <div className="knowledge-chunk" key={chunk.id}>
-              <span>#{chunk.chunkIndex + 1}</span>
-              <p>{chunk.content}</p>
-            </div>
-          ))
-        ) : (
-          <div className="manager-placeholder compact">{t("noChunks")}</div>
-        )}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function formatFileSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-type ResourceQuery = {
-  isLoading: boolean;
-  isError: boolean;
-  refetch: () => unknown;
-};
-
-function ManagerSubTabs({
-  value,
-  onChange,
-  t,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  t: (key: string) => string;
-}) {
-  return (
-    <div className="manager-subtabs" role="tablist">
-      <button
-        type="button"
-        role="tab"
-        aria-selected={value === "installed"}
-        className={value === "installed" ? "is-active" : ""}
-        onClick={() => onChange("installed")}
-      >
-        {t("installed")}
-      </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={value === "marketplace"}
-        className={value === "marketplace" ? "is-active" : ""}
-        onClick={() => onChange("marketplace")}
-      >
-        <Globe2 size={13} />
-        {t("onlineRepositories")}
-      </button>
-    </div>
-  );
-}
-
-function RepositorySearch({
-  value,
-  onChange,
-  onSubmit,
-  pending,
-  source,
-  onSourceChange,
-  includeSkillHub = false,
-  includeClawHub = false,
-  t,
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: () => void;
-  pending: boolean;
-  source: string;
-  onSourceChange: (source: string) => void;
-  includeSkillHub?: boolean;
-  includeClawHub?: boolean;
-  t: (key: string) => string;
-}) {
-  return (
-    <form
-      className="repository-search"
-      onSubmit={(event) => {
-        event.preventDefault();
-        onSubmit();
-      }}
-    >
-      <Search size={15} />
-      <input
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={t("repositorySearchPlaceholder")}
-        aria-label={t("repositorySearchPlaceholder")}
-      />
-      <select
-        className="source-select"
-        value={source}
-        onChange={(event) => onSourceChange(event.target.value)}
-        aria-label={t("searchSource")}
-      >
-        {includeSkillHub ? <option value="skillhub">{t("searchSkillHub")}</option> : null}
-        <option value="all">{t("searchAllSources")}</option>
-        <option value="curated">{t("searchCurated")}</option>
-        <option value="github">{t("searchGithub")}</option>
-        {includeClawHub ? <option value="clawhub">{t("searchClawHub")}</option> : null}
-      </select>
-      <button type="submit" className="secondary-button" disabled={pending}>
-        {pending ? (
-          <LoaderCircle size={14} className="spin" />
-        ) : (
-          <Search size={14} />
-        )}
-        {t("search")}
-      </button>
-    </form>
-  );
-}
-
-function RepositoryRow({
-  repository,
-  onInspect,
-  actionLabel,
-  t,
-}: {
-  repository: SkillRepository | McpRepository;
-  onInspect?: () => void;
-  actionLabel: string | ((repository: SkillRepository | McpRepository) => string);
-  t: (key: string) => string;
-}) {
-  return (
-    <div className="repository-row">
-      <div className="repository-main">
-        <div className="repository-title">
-          <strong>{repository.name}</strong>
-          {repository.stars > 0 ? (
-            <span className="repository-stars">
-              ★ {repository.stars.toLocaleString()}
-            </span>
-          ) : null}
-        </div>
-        <p>{repository.description || t("noDescription")}</p>
-        <span className="repository-source">
-          {repository.sourceType === "MCP_REGISTRY"
-            ? t("mcpRegistry")
-            : repository.sourceType === "CURATED"
-            ? t("curatedSource")
-            : t("githubSearch")}{" "}
-          · {repository.defaultBranch}
-        </span>
-      </div>
-      <div className="repository-actions">
-        <a
-          className="icon-button"
-          href={repository.url}
-          target="_blank"
-          rel="noreferrer"
-          aria-label={t("openRepository")}
-          title={t("openRepository")}
-        >
-          <ExternalLink size={15} />
-        </a>
-        {onInspect ? (
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={onInspect}
-          >
-            {typeof actionLabel === "function" ? actionLabel(repository) : actionLabel}
-          </button>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
-function SkillsManager({
-  installed,
-  query,
-  onToggle,
-  t,
-}: {
-  installed: Skill[];
-  query: ResourceQuery;
-  onToggle: (item: { id: string; enabled: boolean }) => void;
-  t: (key: string) => string;
-}) {
-  const queryClient = useQueryClient();
-  const [section, setSection] = useState("installed");
-  const [search, setSearch] = useState("");
-  const [searchSource, setSearchSource] = useState("skillhub");
-  const [visibleCount, setVisibleCount] = useState(30);
-  const [selectedRepo, setSelectedRepo] = useState<SkillRepository | null>(
-    null,
-  );
-  const [editorFor, setEditorFor] = useState<Skill | null | undefined>(undefined);
-  const [editorId, setEditorId] = useState("");
-  const [editorMarkdown, setEditorMarkdown] = useState("");
-  const [editorEnabled, setEditorEnabled] = useState(true);
-  const [deleteTarget, setDeleteTarget] = useState<Skill | null>(null);
-  const [notice, setNotice] = useState("");
-  const detailQuery = useQuery({
-    queryKey: ["skill-detail", editorFor?.id],
-    queryFn: () => studioApi.getSkill(editorFor?.id ?? ""),
-    enabled: editorFor?.id !== undefined,
-  });
-  const curatedQuery = useQuery({
-    queryKey: ["skill-repositories"],
-    queryFn: studioApi.listSkillRepositories,
-    enabled: section === "marketplace",
-  });
-  const skillHubRepository = curatedQuery.data?.find(
-    (repository) => repository.id === "ethanyoq-skill-hub",
-  );
-  const skillHubQuery = useQuery({
-    queryKey: [
-      "skillhub-skills",
-      skillHubRepository?.url,
-      skillHubRepository?.defaultBranch,
-    ],
-    queryFn: () =>
-      studioApi.discoverRepositorySkills({
-        repoUrl: skillHubRepository?.url ?? "",
-        ref: skillHubRepository?.defaultBranch,
-        limit: 100,
-      }),
-    enabled:
-      section === "marketplace" &&
-      searchSource === "skillhub" &&
-      Boolean(skillHubRepository),
-  });
-  const searchMutation = useMutation({
-    mutationFn: studioApi.searchSkillRepositories,
-  });
-  const clawHubQuery = useQuery({
-    queryKey: ["clawhub-skills", search],
-    queryFn: () => studioApi.searchClawHubSkills({ query: search.trim() || undefined, limit: 30 }),
-    enabled: section === "marketplace" && searchSource === "clawhub",
-  });
-  const discoverMutation = useMutation({
-    mutationFn: studioApi.discoverRepositorySkills,
-  });
-  const installMutation = useMutation({
-    mutationFn: studioApi.installSkill,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
-      setNotice(t("completed"));
-      discoverMutation.reset();
-    },
-  });
-  const installClawHubMutation = useMutation({
-    mutationFn: studioApi.installClawHubSkill,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
-      setNotice(t("completed"));
-    },
-  });
-  const installingRepositorySkillId = installMutation.isPending
-    ? installMutation.variables?.id
-    : undefined;
-  const installingClawHubReference = installClawHubMutation.isPending
-    ? installClawHubMutation.variables?.reference
-    : undefined;
-  const deleteMutation = useMutation({
-    mutationFn: studioApi.deleteSkill,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
-      setDeleteTarget(null);
-      setNotice(t("completed"));
-    },
-  });
-  const createMutation = useMutation({
-    mutationFn: studioApi.createSkill,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
-      setEditorFor(undefined);
-      setNotice(t("skillSaved"));
-    },
-  });
-  const updateMutation = useMutation({
-    mutationFn: ({ id, skillMarkdown, enabled }: { id: string; skillMarkdown: string; enabled: boolean }) =>
-      studioApi.updateSkillContent(id, { skillMarkdown, enabled }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
-      queryClient.invalidateQueries({ queryKey: ["skill-detail"] });
-      setEditorFor(undefined);
-      setNotice(t("skillSaved"));
-    },
-  });
-  useEffect(() => {
-    if (editorFor && detailQuery.data?.summary.id === editorFor.id) {
-      setEditorId(editorFor.id);
-      setEditorMarkdown(detailQuery.data.skillMarkdown);
-      setEditorEnabled(detailQuery.data.summary.enabled);
-    }
-  }, [detailQuery.data, editorFor]);
-  const repositories = (searchMutation.data ?? curatedQuery.data ?? []).filter((repo) => {
-    if (searchSource === "curated") return repo.sourceType === "CURATED";
-    if (searchSource === "github") return repo.sourceType !== "CURATED";
-    return true;
-  });
-  const normalizedSkillHubSearch = search.trim().toLocaleLowerCase();
-  const skillHubSkills = (skillHubQuery.data ?? []).filter((skill) =>
-    !normalizedSkillHubSearch ||
-    `${skill.name} ${skill.description}`
-      .toLocaleLowerCase()
-      .includes(normalizedSkillHubSearch),
-  );
-  const visibleRepositories = repositories.slice(0, visibleCount);
-  const discover = (repository: SkillRepository) => {
-    setSelectedRepo(repository);
-    discoverMutation.mutate({
-      repoUrl: repository.url,
-      ref: repository.defaultBranch,
-      limit: 50,
-    });
-  };
-
-  return (
-    <div className="manager-stack">
-      {deleteTarget ? (
-        <InlineDangerConfirm
-          title={`${t("delete")} · ${deleteTarget.name}`}
-          description={`${t("confirmDelete")}: ${deleteTarget.name}`}
-          confirmLabel={t("delete")}
-          busy={deleteMutation.isPending}
-          onCancel={() => setDeleteTarget(null)}
-          onConfirm={() => deleteMutation.mutate(deleteTarget.id)}
-        />
-      ) : null}
-      <ManagerSubTabs
-        value={section}
-        onChange={(next) => {
-          setSection(next);
-          setSelectedRepo(null);
-          setNotice("");
-        }}
-        t={t}
-      />
-      {notice ? (
-        <div className="manager-notice success">
-          <CheckCircle2 size={14} />
-          {notice}
-        </div>
-      ) : null}
-      {section === "installed" ? (
-        <QueryResourceState query={query} t={t}>
-          <div className="manager-toolbar">
-            <div>
-              <strong>{t("installedSkills")}</strong>
-              <small>{t("skillsHint")}</small>
-            </div>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => {
-                setEditorFor(null);
-                setEditorId("");
-                setEditorMarkdown("---\nname: \ndescription: \n---\n# New Skill\n\n");
-                setEditorEnabled(true);
-                setNotice("");
-              }}
-            >
-              <Plus size={14} />
-              {t("newSkill")}
-            </button>
-          </div>
-          {editorFor !== undefined ? (
-            <form
-              className="skill-editor"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (!editorId.trim() || !editorMarkdown.trim()) return;
-                if (editorFor) {
-                  updateMutation.mutate({
-                    id: editorFor.id,
-                    skillMarkdown: editorMarkdown,
-                    enabled: editorEnabled,
-                  });
-                } else {
-                  createMutation.mutate({
-                    id: editorId.trim(),
-                    skillMarkdown: editorMarkdown,
-                    enabled: editorEnabled,
-                    overwrite: false,
-                  });
-                }
-              }}
-            >
-              <div className="skill-editor-heading">
-                <div>
-                  <strong>{editorFor ? t("editSkill") : t("newSkill")}</strong>
-                  {editorFor && detailQuery.isLoading ? <small>{t("loading")}</small> : null}
-                </div>
-                <button type="button" className="icon-button" onClick={() => setEditorFor(undefined)} aria-label={t("close")} title={t("close")}>
-                  <X size={15} />
-                </button>
-              </div>
-              <label>
-                {t("skillId")}
-                <input value={editorId} onChange={(event) => setEditorId(event.target.value)} readOnly={Boolean(editorFor)} required />
-              </label>
-              <label>
-                {t("skillMarkdown")}
-                <textarea value={editorMarkdown} onChange={(event) => setEditorMarkdown(event.target.value)} rows={14} required />
-              </label>
-              <label className="checkbox-row">
-                <input type="checkbox" checked={editorEnabled} onChange={(event) => setEditorEnabled(event.target.checked)} />
-                {t("enabled")}
-              </label>
-              {(createMutation.error || updateMutation.error) ? (
-                <div className="manager-notice error"><CircleAlert size={14} />{(createMutation.error || updateMutation.error) instanceof Error ? (createMutation.error || updateMutation.error)?.message : t("skillSaveFailed")}</div>
-              ) : null}
-              <div className="inline-form-actions">
-                <button type="button" className="secondary-button" onClick={() => setEditorFor(undefined)}>{t("cancel")}</button>
-                <button type="submit" className="primary-button" disabled={createMutation.isPending || updateMutation.isPending || (Boolean(editorFor) && detailQuery.isLoading)}>
-                  {(createMutation.isPending || updateMutation.isPending) ? <LoaderCircle size={14} className="spin" /> : <Check size={14} />}
-                  {t("save")}
-                </button>
-              </div>
-            </form>
-          ) : null}
-          {installed.map((skill) => (
-            <ResourceRow
-              key={skill.id}
-              icon={<Sparkles size={15} />}
-              title={skill.name}
-              detail={skill.description}
-              status={skill.enabled ? t("enabled") : t("disabled")}
-              trailing={
-                <span className="row-actions">
-                  <ToggleButton
-                    checked={skill.enabled}
-                    onChange={(enabled) => onToggle({ id: skill.id, enabled })}
-                    label={skill.enabled ? t("disable") : t("enable")}
-                  />
-                  <button type="button" className="text-button" onClick={() => {
-                    setEditorFor(skill);
-                    setEditorId(skill.id);
-                    setEditorMarkdown("");
-                    setEditorEnabled(skill.enabled);
-                    setNotice("");
-                  }}>
-                    <Pencil size={14} /> {t("editSkill")}
-                  </button>
-                  <button
-                    type="button"
-                    className="text-button danger-text-button"
-                    onClick={() => setDeleteTarget(skill)}
-                  >
-                    {t("delete")}
-                  </button>
-                </span>
-              }
-            />
-          ))}
-        </QueryResourceState>
-      ) : (
-        <div className="marketplace-stack">
-          <RepositorySearch
-            value={search}
-            onChange={setSearch}
-            pending={
-              searchMutation.isPending ||
-              (searchSource === "skillhub" && skillHubQuery.isFetching)
-            }
-            source={searchSource}
-            includeSkillHub
-            includeClawHub
-            onSourceChange={(src) => {
-              setSearchSource(src);
-              setVisibleCount(30);
-            }}
-            onSubmit={() => {
-              setNotice("");
-              if (searchSource === "skillhub") {
-                void skillHubQuery.refetch();
-              } else if (searchSource === "clawhub") {
-                void clawHubQuery.refetch();
-              } else {
-                searchMutation.mutate({
-                  query: search.trim() || undefined,
-                  limit: 30,
-                });
-              }
-            }}
-            t={t}
-          />
-          {searchSource === "skillhub" ? (
-            skillHubRepository ? (
-              <SkillDiscovery
-                repository={skillHubRepository}
-                query={{
-                  data: skillHubSkills,
-                  isPending: skillHubQuery.isLoading || skillHubQuery.isFetching,
-                  isError: skillHubQuery.isError,
-                }}
-                installed={installed}
-                installing={installMutation.isPending}
-                installingSkillId={installingRepositorySkillId}
-                installError={installMutation.error}
-                onBack={() => setSearchSource("all")}
-                onInstall={(skill) =>
-                  installMutation.mutate({
-                    repoUrl: skill.repositoryUrl,
-                    ref: skill.ref,
-                    path: skill.path || undefined,
-                    id: skill.installId,
-                    enabled: true,
-                    overwrite: false,
-                  })
-                }
-                t={t}
-              />
-            ) : (
-              <RepositoryResults
-                repositories={[]}
-                loading={curatedQuery.isLoading}
-                error={curatedQuery.isError}
-                onRetry={() => void curatedQuery.refetch()}
-                actionLabel={t("viewSkills")}
-                t={t}
-              />
-            )
-          ) : searchSource === "clawhub" ? (
-            <ClawHubSkillResults
-              skills={clawHubQuery.data ?? []}
-              loading={clawHubQuery.isLoading || clawHubQuery.isFetching}
-              error={clawHubQuery.error}
-              installed={installed}
-              installing={installClawHubMutation.isPending}
-              installingReference={installingClawHubReference}
-              installError={installClawHubMutation.error}
-              onRetry={() => void clawHubQuery.refetch()}
-              onInstall={(skill) => installClawHubMutation.mutate({ reference: skill.reference, enabled: true, overwrite: false })}
-              t={t}
-            />
-          ) : selectedRepo ? (
-            <SkillDiscovery
-              repository={selectedRepo}
-              query={discoverMutation}
-              installed={installed}
-              installing={installMutation.isPending}
-              installingSkillId={installingRepositorySkillId}
-              installError={installMutation.error}
-              onBack={() => {
-                setSelectedRepo(null);
-                discoverMutation.reset();
-              }}
-              onInstall={(skill) =>
-                installMutation.mutate({
-                  repoUrl: skill.repositoryUrl,
-                  ref: skill.ref,
-                  path: skill.path || undefined,
-                  id: skill.installId,
-                  enabled: true,
-                  overwrite: false,
-                })
-              }
-              t={t}
-            />
-          ) : (
-            <>
-              <RepositoryResults
-                repositories={visibleRepositories}
-                loading={curatedQuery.isLoading || searchMutation.isPending}
-                error={curatedQuery.isError || searchMutation.isError}
-                onRetry={() => void curatedQuery.refetch()}
-                onInspect={discover}
-                actionLabel={t("viewSkills")}
-                t={t}
-              />
-              {repositories.length > visibleCount ? (
-                <button
-                  type="button"
-                  className="secondary-button load-more-button"
-                  onClick={() => setVisibleCount((c) => c + 30)}
-                >
-                  <ChevronDown size={14} />
-                  {t("loadMore")}
-                </button>
-              ) : null}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function RepositoryResults({
-  repositories,
-  loading,
-  error,
-  onRetry,
-  onInspect,
-  actionLabel,
-  t,
-}: {
-  repositories: Array<SkillRepository | McpRepository>;
-  loading: boolean;
-  error: boolean;
-  onRetry: () => void;
-  onInspect?: (repository: any) => void;
-  actionLabel: string | ((repository: SkillRepository | McpRepository) => string);
-  t: (key: string) => string;
-}) {
-  if (loading)
-    return (
-      <div className="manager-placeholder">
-        <LoaderCircle size={18} className="spin" />
-        <span>{t("loadingRepositories")}</span>
-      </div>
-    );
-  if (error)
-    return (
-      <div className="manager-placeholder">
-        <CircleAlert size={18} />
-        <span>{t("repositoryLoadFailed")}</span>
-        <button type="button" className="secondary-button" onClick={onRetry}>
-          {t("retryLoad")}
-        </button>
-      </div>
-    );
-  return repositories.length ? (
-    <div className="repository-list">
-      {repositories.map((repository) => (
-        <RepositoryRow
-          key={repository.id}
-          repository={repository}
-          onInspect={
-            onInspect &&
-            "defaultBranch" in repository &&
-            (!("installType" in repository) || repository.installType !== "REPOSITORY")
-              ? () => onInspect(repository)
-              : undefined
-          }
-          actionLabel={actionLabel}
-          t={t}
-        />
-      ))}
-    </div>
-  ) : (
-    <div className="manager-placeholder compact">{t("noRepositories")}</div>
-  );
-}
-
-function ClawHubSkillResults({
-  skills,
-  loading,
-  error,
-  installed,
-  installing,
-  installingReference,
-  installError,
-  onRetry,
-  onInstall,
-  t,
-}: {
-  skills: ClawHubSkill[];
-  loading: boolean;
-  error: unknown;
-  installed: Skill[];
-  installing: boolean;
-  installingReference?: string;
-  installError: unknown;
-  onRetry: () => void;
-  onInstall: (skill: ClawHubSkill) => void;
-  t: (key: string) => string;
-}) {
-  if (loading) return <div className="manager-placeholder"><LoaderCircle size={18} className="spin" /><span>{t("loadingRepositories")}</span></div>;
-  if (error) return <div className="manager-placeholder"><CircleAlert size={18} /><span>{error instanceof Error ? error.message : t("repositoryLoadFailed")}</span><button type="button" className="secondary-button" onClick={onRetry}>{t("retryLoad")}</button></div>;
-  const installedSources = new Set(installed.map((skill) => skill.sourceRepository));
-  return skills.length ? (
-    <div className="repository-list">
-      {installError ? <div className="manager-notice error"><CircleAlert size={14} />{installError instanceof Error ? installError.message : t("installFailed")}</div> : null}
-      {skills.map((skill) => {
-        const isInstalled = installedSources.has(`clawhub/${skill.reference}`);
-        const isInstalling = installingReference === skill.reference;
-        return <div className="repository-row" key={skill.id}>
-          <div className="repository-main">
-            <div className="repository-title"><strong>{skill.name}</strong>{skill.official ? <span className="repository-stars">{t("official")}</span> : null}</div>
-            <p>{skill.description || t("noDescription")}</p>
-            <span className="repository-source">ClawHub · {skill.reference} · {skill.downloads.toLocaleString()} {t("downloads")}</span>
-          </div>
-          <div className="repository-actions">
-            <a className="icon-button" href={skill.url} target="_blank" rel="noreferrer" aria-label={t("openRepository")} title={t("openRepository")}><ExternalLink size={15} /></a>
-            <button type="button" className={isInstalled ? "secondary-button" : "primary-button"} disabled={isInstalled || installing || skill.suspicious} onClick={() => onInstall(skill)}>
-              {isInstalling ? <LoaderCircle size={14} className="spin" /> : <Package size={14} />}{isInstalled ? t("installed") : skill.suspicious ? t("reviewRequired") : t("install")}
-            </button>
-          </div>
-        </div>;
-      })}
-    </div>
-  ) : <div className="manager-placeholder compact">{t("noRepositories")}</div>;
-}
-
-function SkillDiscovery({
-  repository,
-  query,
-  installed,
-  installing,
-  installingSkillId,
-  installError,
-  onBack,
-  onInstall,
-  t,
-}: {
-  repository: SkillRepository;
-  query: { data?: RepositorySkill[]; isPending: boolean; isError: boolean };
-  installed: Skill[];
-  installing: boolean;
-  installingSkillId?: string;
-  installError: unknown;
-  onBack: () => void;
-  onInstall: (skill: RepositorySkill) => void;
-  t: (key: string) => string;
-}) {
-  const installedIds = new Set(installed.map((skill) => skill.id));
-  return (
-    <div className="discovery-view">
-      <button
-        type="button"
-        className="text-button back-button"
-        onClick={onBack}
-      >
-        ← {t("backToRepositories")}
-      </button>
-      <div className="discovery-heading">
-        <div>
-          <strong>{repository.name}</strong>
-          <span>{t("skillsFoundFromRepository")}</span>
-        </div>
-        <a
-          href={repository.url}
-          target="_blank"
-          rel="noreferrer"
-          className="source-link"
-        >
-          <ExternalLink size={13} />
-          {t("openRepository")}
-        </a>
-      </div>
-      {installError ? (
-        <div className="manager-notice error" role="alert">
-          <CircleAlert size={14} />
-          {installError instanceof Error && installError.message
-            ? installError.message
-            : t("installFailed")}
-        </div>
-      ) : null}
-      {query.isPending ? (
-        <div className="manager-placeholder">
-          <LoaderCircle size={18} className="spin" />
-          <span>{t("discoveringSkills")}</span>
-        </div>
-      ) : query.isError ? (
-        <div className="manager-placeholder">
-          <CircleAlert size={18} />
-          <span>{t("discoverFailed")}</span>
-        </div>
-      ) : query.data?.length ? (
-        <div className="skill-candidate-list">
-          {query.data.map((skill) => {
-            const isInstalled = installedIds.has(skill.installId);
-            const isInstalling = installingSkillId === skill.installId;
-            return (
-              <div
-                className="skill-candidate"
-                key={`${skill.repositoryUrl}:${skill.path}`}
-              >
-                <div>
-                  <strong>{skill.name}</strong>
-                  <p>{skill.description}</p>
-                  <span>{skill.path || "SKILL.md"}</span>
-                </div>
-                <button
-                  type="button"
-                  className={
-                    isInstalled ? "secondary-button" : "primary-button"
-                  }
-                  disabled={isInstalled || installing}
-                  onClick={() => onInstall(skill)}
-                >
-                  {isInstalled ? (
-                    <>
-                      <Check size={14} />
-                      {t("installed")}
-                    </>
-                  ) : isInstalling ? (
-                    <LoaderCircle size={14} className="spin" />
-                  ) : (
-                    <>
-                      <Package size={14} />
-                      {t("install")}
-                    </>
-                  )}
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <div className="manager-placeholder compact">{t("noSkillsFound")}</div>
-      )}
-    </div>
-  );
-}
-
-type McpConnectionForm = {
-  name: string;
-  description: string;
-  transportType: "STDIO" | "STREAMABLE_HTTP" | "SSE";
-  command: string;
-  args: string;
-  endpoint: string;
-  env: string;
-};
-
-const mcpConnectionSchema = z.object({
-  name: z.string().trim().min(1),
-  description: z.string(),
-  transportType: z.enum(["STDIO", "STREAMABLE_HTTP", "SSE"]),
-  command: z.string(),
-  args: z.string(),
-  endpoint: z.string(),
-  env: z.string(),
-});
-
-const emptyMcpConnectionForm: McpConnectionForm = {
-  name: "",
-  description: "",
-  transportType: "STDIO",
-  command: "",
-  args: "",
-  endpoint: "",
-  env: "",
-};
-
-function parseMcpEnvironment(value: string) {
-  const entries = value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .flatMap((line) => {
-      const divider = line.indexOf("=");
-      return divider > 0
-        ? [
-            [
-              line.slice(0, divider).trim(),
-              line.slice(divider + 1).trim(),
-            ] as const,
-          ]
-        : [];
-    });
-  return entries.length ? Object.fromEntries(entries) : undefined;
-}
-
-function McpManager({
-  connections,
-  query,
-  onToggle,
-  onRefresh,
-  refreshing,
-  refreshingId,
-  refreshError,
-  t,
-}: {
-  connections: McpConnection[];
-  query: ResourceQuery;
-  onToggle: (item: { id: string; enabled: boolean }) => void;
-  onRefresh: (id: string) => void;
-  refreshing: boolean;
-  refreshingId?: string;
-  refreshError: unknown;
-  t: (key: string) => string;
-}) {
-  const queryClient = useQueryClient();
-  const [section, setSection] = useState("installed");
-  const [search, setSearch] = useState("");
-  const [searchSource, setSearchSource] = useState("all");
-  const [visibleRepositoryCount, setVisibleRepositoryCount] = useState(24);
-  const [selectedRepo, setSelectedRepo] = useState<McpRepository | null>(null);
-  const [notice, setNotice] = useState("");
-  const [verificationTargetId, setVerificationTargetId] = useState<string | null>(
-    null,
-  );
-  const [editorFor, setEditorFor] = useState<McpConnection | null | undefined>(
-    undefined,
-  );
-  const [deleteTarget, setDeleteTarget] = useState<McpConnection | null>(null);
-  const form = useForm<McpConnectionForm>({
-    defaultValues: emptyMcpConnectionForm,
-  });
-  const curatedQuery = useQuery({
-    queryKey: ["mcp-repositories"],
-    queryFn: studioApi.listMcpRepositories,
-    enabled: section === "marketplace",
-  });
-  const searchMutation = useMutation({
-    mutationFn: studioApi.searchMcpRepositories,
-  });
-  const installMutation = useMutation({
-    mutationFn: (repository: McpRepository) =>
-      repository.installType === "REMOTE"
-        ? studioApi.createMcpConnection({
-            name: repository.name,
-            description: repository.description,
-            transportType: repository.transportType ?? "STREAMABLE_HTTP",
-            endpoint: repository.endpoint ?? undefined,
-            enabled: true,
-          })
-        : studioApi.installNpmMcp({
-            name: repository.name,
-            description: repository.description,
-            npmPackage: repository.npmPackage ?? "",
-            enabled: true,
-            refreshTools: true,
-          }),
-    onSuccess: async (connection) => {
-      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-      setSelectedRepo(null);
-      const toolsDiscovered = Boolean(connection.tools?.length);
-      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
-      setVerificationTargetId(toolsDiscovered ? null : connection.id);
-    },
-    onError: () => {
-      void queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-    },
-  });
-  const verifyInstallationMutation = useMutation({
-    mutationFn: studioApi.refreshMcpTools,
-    onSuccess: async (connection) => {
-      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-      const toolsDiscovered = Boolean(connection.tools?.length);
-      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
-      setVerificationTargetId(toolsDiscovered ? null : connection.id);
-    },
-    onError: () => {
-      void queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-    },
-  });
-  const saveMutation = useMutation({
-    mutationFn: ({
-      target,
-      values,
-    }: {
-      target: McpConnection | null;
-      values: McpConnectionForm;
-    }) => {
-      const parsed = mcpConnectionSchema.parse(values);
-      const payload = {
-        name: parsed.name,
-        description: parsed.description.trim() || undefined,
-        transportType: parsed.transportType,
-        ...(parsed.command.trim() ? { command: parsed.command.trim() } : {}),
-        ...(parsed.args.trim() ? { args: parsed.args.split(/\s+/) } : {}),
-        ...(parsed.endpoint.trim() ? { endpoint: parsed.endpoint.trim() } : {}),
-        ...(parseMcpEnvironment(parsed.env)
-          ? { env: parseMcpEnvironment(parsed.env) }
-          : {}),
-      };
-      return target
-        ? studioApi.updateMcpConnection(target.id, payload)
-        : studioApi.createMcpConnection(payload);
-    },
-    onSuccess: async (connection) => {
-      await queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-      setEditorFor(undefined);
-      const toolsDiscovered = Boolean(connection.tools?.length);
-      setNotice(toolsDiscovered ? t("completed") : t("mcpAddedNeedsRefresh"));
-      setVerificationTargetId(toolsDiscovered ? null : connection.id);
-    },
-  });
-  const deleteMutation = useMutation({
-    mutationFn: studioApi.deleteMcpConnection,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-      setDeleteTarget(null);
-      setNotice(t("completed"));
-    },
-  });
-  const setToolEnabled = useMutation({
-    mutationFn: ({
-      connectionId,
-      toolName,
-      enabled,
-    }: {
-      connectionId: string;
-      toolName: string;
-      enabled: boolean;
-    }) => studioApi.setMcpToolEnabled(connectionId, toolName, enabled),
-    onSuccess: (tool, variables) => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-connections"] });
-      setEditorFor((current) =>
-        current && current.id === variables.connectionId
-          ? {
-              ...current,
-              tools: (current.tools ?? []).map((candidate) =>
-                candidate.name === tool.name ? tool : candidate,
-              ),
-            }
-          : current,
-      );
-    },
-  });
-  const invocationQuery = useQuery({
-    queryKey: ["mcp-tool-invocations", editorFor?.id],
-    queryFn: studioApi.listMcpToolInvocations,
-    enabled: Boolean(editorFor?.id),
-  });
-  const repositories = (searchMutation.data ?? curatedQuery.data ?? []).filter((repo) => {
-    if (searchSource === "curated") return repo.sourceType === "MCP_REGISTRY";
-    if (searchSource === "github") return repo.sourceType !== "MCP_REGISTRY";
-    return true;
-  });
-  const openEditor = (connection: McpConnection | null) => {
-    form.reset(
-      connection
-        ? {
-            name: connection.name,
-            description: displayMcpDescription(connection.description, ""),
-            transportType:
-              connection.transportType === "SSE"
-                ? "SSE"
-                : connection.transportType === "STREAMABLE_HTTP"
-                  ? "STREAMABLE_HTTP"
-                  : "STDIO",
-            command: connection.command ?? "",
-            args: connection.args?.join(" ") ?? "",
-            endpoint: connection.endpoint ?? "",
-            env: connection.envKeys?.join("\n") ?? "",
-          }
-        : emptyMcpConnectionForm,
-    );
-    setEditorFor(connection);
-  };
-  const transportType = form.watch("transportType");
-
-  if (editorFor !== undefined)
-    return (
-      <div className="mcp-detail">
-        <button
-          type="button"
-          className="text-button back-button"
-          onClick={() => setEditorFor(undefined)}
-        >
-          <ArrowLeft size={14} />
-          {t("mcp")}
-        </button>
-        <div className="panel-heading">
-          <div>
-            <h3>{editorFor ? t("editMcp") : t("addMcp")}</h3>
-            <p>{t("mcpEditorHint")}</p>
-          </div>
-        </div>
-        <form
-          className="mcp-editor"
-          onSubmit={form.handleSubmit((values) =>
-            saveMutation.mutate({ target: editorFor, values }),
-          )}
-        >
-          <div className="model-form-grid">
-            <label>
-              {t("mcpName")}
-              <input {...form.register("name")} autoFocus />
-            </label>
-            <label>
-              {t("mcpTransport")}
-              <select {...form.register("transportType")}>
-                <option value="STDIO">STDIO</option>
-                <option value="STREAMABLE_HTTP">Streamable HTTP</option>
-                <option value="SSE">SSE</option>
-              </select>
-            </label>
-            <label className="mcp-span-two">
-              {t("description")}
-              <input {...form.register("description")} />
-            </label>
-            {transportType === "STDIO" ? (
-              <>
-                <label>
-                  {t("mcpCommand")}
-                  <input {...form.register("command")} placeholder="npx" />
-                </label>
-                <label>
-                  {t("mcpArguments")}
-                  <input
-                    {...form.register("args")}
-                    placeholder="-y @modelcontextprotocol/server-filesystem"
-                  />
-                </label>
-              </>
-            ) : (
-              <label className="mcp-span-two">
-                {t("mcpEndpoint")}
-                <input
-                  {...form.register("endpoint")}
-                  type="url"
-                  placeholder="https://example.com/mcp"
-                />
-              </label>
-            )}
-            <label className="mcp-span-two">
-              {t("mcpEnvironment")}
-              <textarea
-                {...form.register("env")}
-                rows={3}
-                placeholder="API_KEY=..."
-              />
-              <small className="form-note">
-                {editorFor?.envKeys?.length
-                  ? `${t("mcpEnvConfigured")}: ${editorFor.envKeys.join(", ")}`
-                  : t("mcpEnvNote")}
-              </small>
-            </label>
-          </div>
-          {editorFor ? (
-            <McpToolList
-              connectionId={editorFor.id}
-              tools={editorFor.tools ?? []}
-              pendingToolName={
-                setToolEnabled.isPending
-                  ? setToolEnabled.variables?.toolName
-                  : undefined
-              }
-              onToggle={(tool) =>
-                setToolEnabled.mutate({
-                  connectionId: editorFor.id,
-                  toolName: tool.name,
-                  enabled: !tool.enabled,
-                })
-              }
-              invocations={(invocationQuery.data ?? []).filter(
-                (invocation) => invocation.connectionId === editorFor.id,
-              )}
-              invocationsLoading={invocationQuery.isLoading}
-              invocationsError={invocationQuery.isError}
-              t={t}
-            />
-          ) : null}
-          {saveMutation.isError ? (
-            <p className="form-error">{t("loadFailed")}</p>
-          ) : null}
-          <div className="inline-form-actions">
-            <button
-              type="button"
-              className="secondary-button"
-              onClick={() => setEditorFor(undefined)}
-            >
-              {t("cancel")}
-            </button>
-            <button
-              type="submit"
-              className="primary-button"
-              disabled={saveMutation.isPending}
-            >
-              {saveMutation.isPending ? (
-                <LoaderCircle size={14} className="spin" />
-              ) : (
-                <Check size={14} />
-              )}
-              {t("save")}
-            </button>
-          </div>
-        </form>
-      </div>
-    );
-
-  return (
-    <div className="manager-stack">
-      {deleteTarget ? (
-        <InlineDangerConfirm
-          title={t("deleteMcp")}
-          description={`${t("deleteMcpHint")} ${deleteTarget.name}`}
-          confirmLabel={t("deleteMcp")}
-          busy={deleteMutation.isPending}
-          onCancel={() => setDeleteTarget(null)}
-          onConfirm={() => deleteMutation.mutate(deleteTarget.id)}
-        />
-      ) : null}
-      <ManagerSubTabs
-        value={section}
-        onChange={(next) => {
-          setSection(next);
-          setSelectedRepo(null);
-          setNotice("");
-          setVerificationTargetId(null);
-        }}
-        t={t}
-      />
-      {notice ? (
-        <div className="manager-notice success">
-          <CheckCircle2 size={14} />
-          {notice}
-          {verificationTargetId ? (
-            <button
-              type="button"
-              className="text-button model-save-notice-action"
-              disabled={verifyInstallationMutation.isPending || refreshing}
-              onClick={() =>
-                verifyInstallationMutation.mutate(verificationTargetId)
-              }
-            >
-              {verifyInstallationMutation.isPending ? (
-                <LoaderCircle size={14} className="spin" />
-              ) : (
-                <RefreshCw size={14} />
-              )}
-              {t("refreshTools")}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      {verifyInstallationMutation.isError ? (
-        <div className="manager-notice error" role="alert">
-          <CircleAlert size={14} />
-          {verifyInstallationMutation.error instanceof Error &&
-          verifyInstallationMutation.error.message
-            ? verifyInstallationMutation.error.message
-            : t("loadFailed")}
-        </div>
-      ) : null}
-      {refreshError ? (
-        <div className="manager-notice error" role="alert">
-          <CircleAlert size={14} />
-          {refreshError instanceof Error && refreshError.message
-            ? refreshError.message
-            : t("loadFailed")}
-        </div>
-      ) : null}
-      {section === "installed" ? (
-        <>
-          <div className="model-toolbar">
-            <span>
-              {connections.length
-                ? `${connections.length} ${t("mcpConnections")}`
-                : t("emptyList")}
-            </span>
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => openEditor(null)}
-            >
-              <Plus size={14} />
-              {t("addMcp")}
-            </button>
-          </div>
-          <QueryResourceState query={query} t={t}>
-            {connections.map((connection) => (
-              <ResourceRow
-                key={connection.id}
-                icon={<Globe2 size={15} />}
-                title={connection.name}
-                detail={
-                  [
-                    displayMcpDescription(
-                      connection.description,
-                      t("mcpDescriptionUnavailable"),
-                    ),
-                    connection.lastError,
-                  ]
-                    .filter(Boolean)
-                    .join(" - ")
-                }
-                status={
-                  connection.enabled
-                    ? `${t("enabled")} 路 ${statusLabel(connection.status, t)}`
-                    : t("disabled")
-                }
-                trailing={
-                  <span className="row-actions">
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => openEditor(connection)}
-                    >
-                      {t("editMcp")}
-                    </button>
-                    <IconButton
-                      label={t("refreshTools")}
-                      disabled={refreshing}
-                      onClick={() => onRefresh(connection.id)}
-                    >
-                      {refreshing && refreshingId === connection.id ? (
-                        <LoaderCircle size={14} className="spin" />
-                      ) : (
-                        <RefreshCw size={14} />
-                      )}
-                    </IconButton>
-                    <ToggleButton
-                      checked={connection.enabled}
-                      onChange={(enabled) =>
-                        onToggle({ id: connection.id, enabled })
-                      }
-                      label={connection.enabled ? t("disable") : t("enable")}
-                    />
-                    <button
-                      type="button"
-                      className="text-button danger-text-button"
-                      onClick={() => setDeleteTarget(connection)}
-                    >
-                      {t("delete")}
-                    </button>
-                  </span>
-                }
-              />
-            ))}
-          </QueryResourceState>
-        </>
-      ) : (
-        <div className="marketplace-stack">
-          <RepositorySearch
-            value={search}
-            onChange={setSearch}
-            pending={searchMutation.isPending}
-            source={searchSource}
-            onSourceChange={(src) => {
-              setSearchSource(src);
-              setVisibleRepositoryCount(24);
-            }}
-            onSubmit={() => {
-              setNotice("");
-              searchMutation.mutate({
-                query: search.trim() || undefined,
-                limit: 30,
-                source:
-                  searchSource === "curated"
-                    ? "registry"
-                    : searchSource === "github"
-                      ? "github"
-                      : undefined,
-              });
-              setVisibleRepositoryCount(24);
-            }}
-            t={t}
-          />
-          {selectedRepo ? (
-            <div className="mcp-install-panel">
-              <button
-                type="button"
-                className="text-button back-button"
-                onClick={() => setSelectedRepo(null)}
-              >
-                <ArrowLeft size={14} />
-                {t("backToRepositories")}
-              </button>
-              <div className="discovery-heading">
-                <div>
-                  <strong>{selectedRepo.name}</strong>
-                  <span>
-                    {selectedRepo.installType === "REMOTE"
-                      ? t("mcpRemoteInstallHint")
-                      : t("mcpNpmInstallHint")}
-                  </span>
-                </div>
-                <a
-                  href={selectedRepo.url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="source-link"
-                >
-                  <ExternalLink size={13} />
-                  {t("openRepository")}
-                </a>
-              </div>
-              <div className="mcp-install-summary">
-                <span>{selectedRepo.installType === "REMOTE" ? t("mcpEndpoint") : t("npmPackage")}</span>
-                <code>{selectedRepo.installType === "REMOTE" ? selectedRepo.endpoint : selectedRepo.npmPackage}</code>
-              </div>
-              {installMutation.isError ? (
-                <p className="form-error">
-                  {installMutation.error instanceof Error
-                    ? installMutation.error.message
-                    : t("installFailed")}
-                </p>
-              ) : null}
-              <button
-                type="button"
-                className="primary-button"
-                disabled={installMutation.isPending}
-                onClick={() => installMutation.mutate(selectedRepo)}
-              >
-                {installMutation.isPending ? (
-                  <LoaderCircle size={14} className="spin" />
-                ) : (
-                  <Package size={14} />
-                )}
-                {selectedRepo.installType === "REMOTE" ? t("addMcp") : t("installMcp")}
-              </button>
-            </div>
-          ) : (
-            <>
-              <RepositoryResults
-                repositories={repositories.slice(0, visibleRepositoryCount)}
-                loading={curatedQuery.isLoading || searchMutation.isPending}
-                error={curatedQuery.isError || searchMutation.isError}
-                onRetry={() => void curatedQuery.refetch()}
-                onInspect={(repository) => setSelectedRepo(repository)}
-                actionLabel={(repository) =>
-                  "installType" in repository && repository.installType === "REMOTE"
-                    ? t("addMcp")
-                    : t("installMcp")
-                }
-                t={t}
-              />
-              {repositories.length > visibleRepositoryCount ? (
-                <button
-                  type="button"
-                  className="secondary-button load-more-button"
-                  onClick={() => setVisibleRepositoryCount((count) => count + 24)}
-                >
-                  <ChevronDown size={14} />
-                  {t("loadMore")}
-                </button>
-              ) : null}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function McpToolList({
-  connectionId,
-  tools,
-  pendingToolName,
-  onToggle,
-  invocations,
-  invocationsLoading,
-  invocationsError,
-  t,
-}: {
-  connectionId: string;
-  tools: McpTool[];
-  pendingToolName?: string;
-  onToggle: (tool: McpTool) => void;
-  invocations: McpToolInvocation[];
-  invocationsLoading: boolean;
-  invocationsError: boolean;
-  t: (key: string) => string;
-}) {
-  return (
-    <section className="mcp-tool-section" aria-label={t("mcpTools")}>
-      <div className="knowledge-documents-heading">
-        <div>
-          <h4>{t("mcpTools")}</h4>
-          <p>{tools.length ? `${tools.length}` : t("noMcpTools")}</p>
-        </div>
-      </div>
-      {tools.length ? (
-        <div className="mcp-tool-list">
-          {tools.map((tool) => (
-            <div className="mcp-tool-row" key={`${connectionId}-${tool.name}`}>
-              <div className="model-glyph">
-                <Wrench size={14} />
-              </div>
-              <div>
-                <div className="node-tool-title">
-                  <strong>{tool.name}</strong>
-                  {tool.riskLevel ? <span className="risk-mark">{tool.riskLevel}</span> : null}
-                </div>
-                <span>{tool.description || t("noDescription")}</span>
-              </div>
-              <ToggleButton
-                checked={tool.enabled}
-                disabled={pendingToolName === tool.name}
-                onChange={() => onToggle(tool)}
-                label={tool.enabled ? t("disable") : t("enable")}
-              />
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="manager-placeholder compact">{t("noMcpTools")}</div>
-      )}
-      <section className="mcp-tool-section" aria-label={t("mcpInvocationAudit")}>
-        <div className="knowledge-documents-heading">
-          <div>
-            <h4>{t("mcpInvocationAudit")}</h4>
-            <p>{invocations.length ? `${invocations.length}` : t("noMcpInvocations")}</p>
-          </div>
-        </div>
-        {invocationsLoading ? (
-          <div className="manager-placeholder compact"><LoaderCircle size={14} className="spin" /> {t("loading")}</div>
-        ) : invocationsError ? (
-          <div className="manager-notice error"><CircleAlert size={14} /> {t("loadFailed")}</div>
-        ) : invocations.length ? (
-          <div className="mcp-invocation-list">
-            {invocations.slice(0, 12).map((invocation) => (
-              <div className="mcp-invocation-row" key={invocation.id}>
-                <Wrench size={14} />
-                <div>
-                  <strong>{invocation.toolName}</strong>
-                  <span>{formatTimestamp(invocation.finishedAt ?? invocation.createdAt)}</span>
-                </div>
-                <span className="list-status">{invocation.status}</span>
-                {invocation.errorCategory ? <small>{invocation.errorCategory}</small> : null}
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div className="manager-placeholder compact">{t("noMcpInvocations")}</div>
-        )}
-      </section>
-    </section>
-  );
-}
-
-function InlineDangerConfirm({
-  title,
-  description,
-  confirmLabel,
-  busy,
-  onCancel,
-  onConfirm,
-}: {
-  title: string;
-  description: string;
-  confirmLabel: string;
-  busy: boolean;
-  onCancel: () => void;
-  onConfirm: () => void;
-}) {
-  const { t } = useTranslation();
-  return (
-    <div className="inline-danger-confirm">
-      <CircleAlert size={16} />
-      <div>
-        <strong>{title}</strong>
-        <p>{description}</p>
-      </div>
-      <div className="inline-form-actions">
-        <button className="secondary-button" type="button" onClick={onCancel}>
-          {t("cancel")}
-        </button>
-        <button
-          className="danger-button"
-          type="button"
-          disabled={busy}
-          onClick={onConfirm}
-        >
-          {busy ? <LoaderCircle size={14} className="spin" /> : null}
-          {confirmLabel}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function QueryResourceState({
-  query,
-  children,
-  t,
-}: {
-  query: { isLoading: boolean; isError: boolean; refetch: () => unknown };
-  children: React.ReactNode;
-  t: (key: string) => string;
-}) {
-  if (query.isLoading)
-    return (
-      <div className="manager-placeholder">
-        <LoaderCircle size={18} className="spin" />
-        <span>{t("loading")}</span>
-      </div>
-    );
-  if (query.isError)
-    return (
-      <div className="manager-placeholder">
-        <CircleAlert size={18} />
-        <span>{t("loadFailed")}</span>
-        <button
-          type="button"
-          className="secondary-button"
-          onClick={() => void query.refetch()}
-        >
-          {t("retryLoad")}
-        </button>
-      </div>
-    );
-  return (
-    <div className="manager-list">
-      {Children.count(children) ? (
-        children
-      ) : (
-        <div className="manager-placeholder compact">
-          <span>{t("emptyList")}</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ResourceRow({
-  icon,
-  title,
-  detail,
-  status,
-  trailing,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  detail: string;
-  status?: string;
-  trailing: React.ReactNode;
-}) {
-  return (
-    <div className="manager-list-item">
-      <span className="model-glyph">{icon}</span>
-      <div>
-        <strong>{title}</strong>
-        <span>{detail}</span>
-      </div>
-      {status ? <span className="list-status">{status}</span> : null}
-      {trailing}
-    </div>
-  );
-}
-
-function ToggleButton({
-  checked,
-  onChange,
-  label,
-  disabled = false,
-}: {
-  checked: boolean;
-  onChange: (checked: boolean) => void;
-  label: string;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      className={`toggle-button ${checked ? "is-on" : ""}`}
-      aria-pressed={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-    >
-      <span />
-    </button>
-  );
 }
 
 function extractApprovalId(payload: string) {
@@ -7385,21 +4771,6 @@ function parseRunCitations(payload: string): Citation[] {
   }
 }
 
-function displayMcpDescription(value: string | undefined, fallback: string) {
-  const text = value?.trim() ?? "";
-  if (!text) return fallback;
-  const suspiciousCount = (text.match(/[?？�]/g) ?? []).length;
-  if (suspiciousCount >= 2 && suspiciousCount / text.length >= 0.12)
-    return fallback;
-  return text;
-}
-
-function formatTimestamp(value?: string) {
-  if (!value) return "-";
-  const timestamp = new Date(value);
-  return Number.isNaN(timestamp.getTime()) ? value : timestamp.toLocaleString();
-}
-
 function formatHistoryTimestamp(value: string, language: string) {
   const timestamp = new Date(value);
   if (Number.isNaN(timestamp.getTime())) return value;
@@ -7429,21 +4800,6 @@ function queuePositionLabel(t: (key: string) => string, position: number) {
 function formatDuration(milliseconds: number) {
   const seconds = milliseconds / 1000;
   return seconds < 10 ? seconds.toFixed(1) : Math.round(seconds).toString();
-}
-
-function statusLabel(status: string | undefined, t: (key: string) => string) {
-  if (!status) return t("offline");
-  const normalized = status.toLowerCase();
-  if (
-    normalized.includes("connected") ||
-    normalized.includes("online") ||
-    normalized.includes("ready") ||
-    normalized.includes("configured")
-  )
-    return t("connectedStatus");
-  if (normalized.includes("degraded") || normalized.includes("error"))
-    return t("degradedStatus");
-  return t("disconnectedStatus");
 }
 
 function idToQueryKey(id: string) {

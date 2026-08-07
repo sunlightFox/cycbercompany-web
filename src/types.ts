@@ -15,6 +15,170 @@ export type Agent = {
   updatedAt?: string
 }
 
+export type AgentVisibility = 'PRIVATE' | 'TEAM' | 'TENANT'
+export type AgentStatus = 'ACTIVE' | 'DISABLED' | 'ARCHIVED'
+export type AgentVersionState = 'DRAFT' | 'PUBLISHED'
+
+export type AgentReference = {
+  id: string
+  revision?: string
+  required?: boolean
+}
+
+export type AgentManifestV2 = {
+  schemaVersion: 2
+  identity: {
+    displayName: string
+    description: string
+    avatarRef?: string
+    category?: string
+    tags?: string[]
+  }
+  persona: {
+    role: string
+    mission: string
+    audience?: string
+    responsibilities: string[]
+    boundaries: string[]
+    traits?: string[]
+    communication?: {
+      defaultLanguage?: string
+      tone?: string[]
+      responseDensity?: 'COMPACT' | 'BALANCED' | 'DETAILED'
+      customInstructions?: string
+    }
+    greeting?: string
+    conversationStarters?: string[]
+    exampleDialogs?: Array<{ role: 'USER' | 'AGENT'; content: string }>
+  }
+  capabilities: {
+    model: {
+      defaultProfileId: string
+      fallbackProfileIds?: string[]
+      selectionMode?: 'FIXED' | 'POLICY'
+    }
+    tools: AgentReference[]
+    skills: AgentReference[]
+    mcpConnections: AgentReference[]
+    knowledgeBases: AgentReference[]
+    collaborators: Array<{ agentId: string; mode: 'AS_TOOL' | 'HANDOFF'; when: string }>
+  }
+  memory: {
+    mode: 'OFF' | 'CONVERSATION' | 'PERSONALIZED'
+    shortTerm: {
+      strategy: 'WINDOW' | 'SUMMARY' | 'HYBRID'
+      maxContextTokens: number
+    }
+    longTerm: {
+      enabled: boolean
+      categories: Array<'PROFILE' | 'SEMANTIC' | 'EPISODIC' | 'PROCEDURAL'>
+      writeMode: 'EXPLICIT_ONLY' | 'SUGGEST' | 'AUTO'
+      retrievalMode: 'KEYWORD' | 'SEMANTIC' | 'HYBRID'
+      topK: number
+      minRelevance?: number
+      ttlDays?: number | null
+      requireEvidence?: boolean
+      sensitiveDataPolicy: 'REJECT' | 'CONFIRM'
+    }
+  }
+  runtime: {
+    autonomy: 'ASSIST' | 'EXECUTE' | 'ORCHESTRATE'
+    planning: 'NONE' | 'IMPLICIT' | 'VISIBLE'
+    maxSteps: number
+    timeoutSeconds: number
+    maxModelTokens?: number
+    maxEstimatedCost?: number | null
+    failureStrategy?: 'STOP' | 'RETRY_SAFE' | 'ASK_USER' | 'FALLBACK_MODEL'
+  }
+  safety: {
+    approvalPreset: 'CONSERVATIVE' | 'BALANCED' | 'CUSTOM'
+    inputGuardrails: AgentReference[]
+    outputGuardrails: AgentReference[]
+    customApprovalRules?: Array<{
+      riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+      decision: 'ALLOW' | 'ASK' | 'DENY'
+    }>
+  }
+  presentation?: {
+    themeToken?: string
+    showPlanByDefault?: boolean
+    showMemoryUsage?: boolean
+  }
+  evaluation?: {
+    suiteIds?: string[]
+    requiredBeforePublish?: boolean
+    minimumPassRate?: number
+  }
+  extensions?: Record<string, unknown>
+}
+
+export type AgentVersionV2 = {
+  id: string
+  revision: number
+  versionNumber: number
+  schemaVersion: number
+  state: AgentVersionState
+  manifest: AgentManifestV2
+  manifestDigest: string
+  compiledPromptDigest: string
+  createdBy: string
+  createdAt: string
+  publishedAt: string | null
+}
+
+export type AgentV2 = {
+  id: string
+  displayName: string
+  description: string
+  avatarRef: string
+  category: string
+  tags: string[]
+  visibility: AgentVisibility
+  status: AgentStatus
+  currentPublishedVersionId: string | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+  currentPublishedVersion: AgentVersionV2 | null
+  latestDraft: AgentVersionV2 | null
+}
+
+export type AgentManifestValidation = {
+  valid: boolean
+  errors: string[]
+  manifestDigest: string | null
+  compiledPromptDigest: string | null
+}
+
+export type AgentDraftTestResult = {
+  agentId: string
+  versionId: string
+  manifestDigest: string
+  modelProfileId: string
+  content: string
+  promptTokens: number | null
+  completionTokens: number | null
+  rawModel: string | null
+  finishReason: string | null
+  toolCallsBlocked: boolean
+  notices: string[]
+}
+
+export type AgentEvaluationReport = {
+  agentId: string
+  versionId: string
+  manifestDigest: string
+  score: number
+  passed: boolean
+  evaluatedAt: string
+  suites: Array<{
+    suiteId: string
+    score: number
+    passed: boolean
+    cases: Array<{ caseId: string; passed: boolean; reason: string }>
+  }>
+}
+
 export type ModelProfile = {
   id: string
   providerType: string
@@ -51,6 +215,12 @@ export type ExecutionMode = 'PERSONAL_LOCAL' | 'LOCAL_AND_NODES' | 'NODES_ONLY'
 export type ExecutionSettings = {
   mode: ExecutionMode
   updatedAt?: string | null
+}
+
+export type SystemStatus = {
+  status: 'READY' | 'UNHEALTHY'
+  code: string | null
+  message: string
 }
 
 export type ApprovalMode = 'on-request' | 'auto-approve' | 'full-access'
@@ -139,6 +309,17 @@ export type RepositorySkill = {
   ref: string
   path: string
   installId: string
+}
+
+export type SkillHubSkill = {
+  id: string
+  name: string
+  description: string
+  reference: string
+  url: string
+  downloads: number
+  verified: boolean
+  source: string
 }
 
 export type ClawHubSkill = {
@@ -403,6 +584,8 @@ export type Conversation = {
   id: string
   title: string
   createdAt?: string
+  archived: boolean
+  archivedAt?: string | null
   messages: Message[]
 }
 

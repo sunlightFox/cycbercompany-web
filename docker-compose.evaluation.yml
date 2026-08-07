@@ -16,7 +16,7 @@ services:
       APP_EXECUTION_ALLOW_NODES_ONLY: "true"
       APP_NODES_BROWSER_ALLOWED_PRIVATE_HOSTS: "127.0.0.1,localhost"
       APP_DATA_DIR: /workspace/.runtime-evaluation-data
-      SEARXNG_ENDPOINT: http://searxng:8080
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       EDGEFN_API_KEY: ${EDGEFN_API_KEY:-}
       GRADLE_USER_HOME: /home/gradle/.gradle
     volumes:
@@ -31,9 +31,6 @@ services:
       timeout: 5s
       retries: 18
       start_period: 90s
-    depends_on:
-      searxng:
-        condition: service_started
     restart: unless-stopped
 
 volumes:

@@ -1,8 +1,14 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
 import { createUuid } from './uuid'
-import type { Agent, ApprovalMode, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeChunk, KnowledgeDocument, KnowledgeSearchResult, KnowledgeSettings, KnowledgeSettingsUpdate, KnowledgeStats, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, RunWorkflow, Skill, SkillDetail, SkillPreflight, SkillRepository, Tool, ToolApproval } from '../types'
+import type { Agent, AgentDraftTestResult, AgentEvaluationReport, AgentManifestV2, AgentManifestValidation, AgentV2, AgentVersionV2, AgentVisibility, ApprovalMode, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeChunk, KnowledgeDocument, KnowledgeSearchResult, KnowledgeSettings, KnowledgeSettingsUpdate, KnowledgeStats, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, RunWorkflow, Skill, SkillDetail, SkillHubSkill, SkillPreflight, SkillRepository, SystemStatus, Tool, ToolApproval } from '../types'
 
 const API_ROOT = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
+const API_V2_ROOT = import.meta.env.VITE_API_V2_BASE_URL ?? API_ROOT.replace(/\/v1\/?$/, '/v2')
+const LOCAL_EXECUTOR_LAUNCHER_URL = (
+  import.meta.env.VITE_LOCAL_EXECUTOR_LAUNCHER_URL ?? 'http://127.0.0.1:8094'
+).replace(/\/+$/, '')
+const API_REQUEST_TIMEOUT_MS = 8_000
+const CORE_REQUEST_TIMEOUT_MS = 4_000
 
 export type StudioApiFieldError = {
   field: string
@@ -41,6 +47,12 @@ export class RunStreamTimeoutError extends Error {
   }
 }
 
+export type LocalExecutorLauncherHealth = {
+  reachable: boolean
+  online: boolean
+  workspace?: string
+}
+
 type ProblemPayload = {
   detail?: string
   message?: string
@@ -58,18 +70,27 @@ function authenticationHeaders(): Record<string, string> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return requestFromRoot<T>(API_ROOT, path, init)
+}
+
+async function requestV2<T>(path: string, init?: RequestInit): Promise<T> {
+  return requestFromRoot<T>(API_V2_ROOT, path, init)
+}
+
+async function requestFromRoot<T>(root: string, path: string, init?: RequestInit): Promise<T> {
   const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
-  const response = await fetch(`${API_ROOT}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
-      'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
-      'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
-      ...authenticationHeaders(),
-      ...init?.headers,
-    },
-  })
+  const response = await fetch(`${root}${path}`, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+      headers: {
+        Accept: 'application/json',
+        ...(init?.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
+        'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
+        'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
+        ...authenticationHeaders(),
+        ...init?.headers,
+      },
+    })
 
   if (!response.ok) {
     throw await apiErrorFromResponse(response, `Request failed with ${response.status}`)
@@ -77,6 +98,48 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
+}
+
+function requestCore<T>(path: string): Promise<T> {
+  return request<T>(path, { signal: AbortSignal.timeout(CORE_REQUEST_TIMEOUT_MS) })
+}
+
+async function requestLocalExecutorLauncherHealth(): Promise<LocalExecutorLauncherHealth> {
+  try {
+    const response = await fetch(`${LOCAL_EXECUTOR_LAUNCHER_URL}/health`, {
+      method: 'GET',
+      mode: 'cors',
+      signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) {
+      return { reachable: false, online: false }
+    }
+    const payload = await response.json().catch(() => ({} as { online?: boolean; workspace?: string }))
+    return {
+      reachable: true,
+      online: Boolean(payload.online),
+      workspace: typeof payload.workspace === 'string' ? payload.workspace : undefined,
+    }
+  } catch {
+    return { reachable: false, online: false }
+  }
+}
+
+async function waitForManagedLocalExecutorOnline(timeoutMs = 30_000): Promise<NodeConnection[]> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const nodes = await request<NodeConnection[]>('/nodes')
+      if (nodes.some((node) => node.kind === 'MANAGED_LOCAL' && node.enabled && node.status?.toUpperCase() === 'ONLINE')) {
+        return nodes
+      }
+    } catch {
+      // The companion can be connecting while the backend is briefly unavailable.
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000))
+  }
+  throw new Error('The local executor is still starting. Please wait and try again.')
 }
 
 async function requestBlob(path: string): Promise<Blob> {
@@ -107,12 +170,25 @@ async function apiErrorFromResponse(response: Response, fallback: string): Promi
 }
 
 export const studioApi = {
-  getExecutionSettings: () => request<ExecutionSettings>('/execution-settings'),
+  getSystemStatus: () => requestCore<SystemStatus>('/system/status'),
+  getExecutionSettings: () => requestCore<ExecutionSettings>('/execution-settings'),
   updateExecutionSettings: (mode: ExecutionMode) => request<ExecutionSettings>('/execution-settings', { method: 'PATCH', body: JSON.stringify({ mode }) }),
-  listAgents: () => request<Agent[]>('/agents'),
+  listAgents: () => requestCore<Agent[]>('/agents'),
   createAgent: (payload: { id: string; name: string; description: string; systemPrompt: string; defaultModelProfileId?: string | null; toolAllowList?: string[]; defaultSkillIds?: string[]; enabled?: boolean }) => request<Agent>('/agents', { method: 'POST', body: JSON.stringify(payload) }),
   updateAgent: (id: string, payload: { name?: string; description?: string; systemPrompt?: string; defaultModelProfileId?: string | null; toolAllowList?: string[]; defaultSkillIds?: string[]; enabled?: boolean }) => request<Agent>(`/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
-  listModels: () => request<ModelProfile[]>('/models'),
+  listAgentsV2: () => requestV2<AgentV2[]>('/agents'),
+  getAgentV2: (id: string) => requestV2<AgentV2>(`/agents/${encodeURIComponent(id)}`),
+  createAgentV2: (payload: { manifest: AgentManifestV2; visibility: AgentVisibility }) => requestV2<AgentV2>('/agents', { method: 'POST', body: JSON.stringify(payload) }),
+  updateAgentV2Settings: (id: string, payload: { visibility?: AgentVisibility; status?: 'ACTIVE' | 'DISABLED'; expectedRevision: number }) => requestV2<AgentV2>(`/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  listAgentV2Versions: (id: string) => requestV2<AgentVersionV2[]>(`/agents/${encodeURIComponent(id)}/versions`),
+  createAgentV2Draft: (id: string) => requestV2<AgentVersionV2>(`/agents/${encodeURIComponent(id)}/drafts`, { method: 'POST' }),
+  updateAgentV2Manifest: (id: string, versionId: string, payload: { manifest: AgentManifestV2; expectedRevision: number }) => requestV2<AgentVersionV2>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/manifest`, { method: 'PUT', body: JSON.stringify(payload) }),
+  validateAgentV2Draft: (id: string, versionId: string) => requestV2<AgentManifestValidation>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/validate`, { method: 'POST' }),
+  testAgentV2Draft: (id: string, versionId: string, messages: Array<{ role: 'USER' | 'ASSISTANT'; content: string }>, modelProfileId?: string) => requestV2<AgentDraftTestResult>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/test-runs`, { method: 'POST', body: JSON.stringify({ messages, modelProfileId: modelProfileId || null }) }),
+  evaluateAgentV2Draft: (id: string, versionId: string) => requestV2<AgentEvaluationReport>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/evaluations`, { method: 'POST' }),
+  publishAgentV2Draft: (id: string, versionId: string) => requestV2<AgentVersionV2>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/publish`, { method: 'POST' }),
+  archiveAgentV2: (id: string) => requestV2<AgentV2>(`/agents/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
+  listModels: () => requestCore<ModelProfile[]>('/models'),
   listModelPresets: () => request<ModelPreset[]>('/models/presets'),
   getModelSettings: () => request<ModelSettings>('/models/settings'),
   saveModel: (payload: { id: string; providerType: string; baseUrl: string; modelName: string; credentialRef?: string; apiKey?: string; capabilities: string[]; enabled: boolean }) => request<ModelProfile>('/models', { method: 'POST', body: JSON.stringify(payload) }),
@@ -127,7 +203,15 @@ export const studioApi = {
   listSkillRepositories: () => request<SkillRepository[]>('/skill-repositories'),
   searchSkillRepositories: (payload: { query?: string; limit?: number }) => request<SkillRepository[]>('/skill-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
   discoverRepositorySkills: (payload: { repoUrl: string; ref?: string; limit?: number }) => request<RepositorySkill[]>('/skill-repositories/discover', { method: 'POST', body: JSON.stringify(payload) }),
+  getSkillMarketplace: (payload: { query?: string; limit?: number } = {}) => {
+    const params = new URLSearchParams()
+    if (payload.query?.trim()) params.set('query', payload.query.trim())
+    if (payload.limit) params.set('limit', String(payload.limit))
+    const suffix = params.size ? `?${params}` : ''
+    return request<{ skillHubSkills: SkillHubSkill[]; clawHubSkills: ClawHubSkill[]; sources: Array<{ id: string; label: string; count: number; status: string }> }>(`/skill-marketplace${suffix}`)
+  },
   installSkill: (payload: { repoUrl: string; ref?: string; path?: string; id?: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills/install', { method: 'POST', body: JSON.stringify(payload) }),
+  installSkillHubSkill: (payload: { reference: string; id?: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills/install/skillhub', { method: 'POST', body: JSON.stringify(payload) }),
   searchClawHubSkills: (payload: { query?: string; limit?: number }) => {
     const params = new URLSearchParams()
     if (payload.query?.trim()) params.set('query', payload.query.trim())
@@ -142,7 +226,9 @@ export const studioApi = {
   listMcpConnections: () => request<McpConnection[]>('/mcp-connections'),
   listMcpRepositories: () => request<McpRepository[]>('/mcp-repositories'),
   searchMcpRepositories: (payload: { query?: string; limit?: number; source?: 'registry' | 'github' }) => request<McpRepository[]>('/mcp-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
+  installMcpRepository: (payload: { repositoryId: string; id?: string; name?: string; description?: string; enabled?: boolean; refreshTools?: boolean }) => request<McpConnection>('/mcp-connections/install', { method: 'POST', body: JSON.stringify(payload) }),
   installNpmMcp: (payload: { id?: string; name: string; description?: string; npmPackage: string; packageArgs?: string[]; env?: Record<string, string>; enabled?: boolean; refreshTools?: boolean }) => request<McpConnection>('/mcp-connections/install-npm', { method: 'POST', body: JSON.stringify(payload) }),
+  importMcpJson: (payload: { json: string; overwrite?: boolean; enabled?: boolean; refreshTools?: boolean }) => request<McpConnection[]>('/mcp-connections/import-json', { method: 'POST', body: JSON.stringify(payload) }),
   createMcpConnection: (payload: { name: string; description?: string; transportType: 'STDIO' | 'STREAMABLE_HTTP' | 'SSE'; command?: string; args?: string[]; endpoint?: string; env?: Record<string, string>; enabled?: boolean }) => request<McpConnection>('/mcp-connections', { method: 'POST', body: JSON.stringify(payload) }),
   updateMcpConnection: (id: string, payload: { name?: string; description?: string; transportType?: 'STDIO' | 'STREAMABLE_HTTP' | 'SSE'; command?: string; args?: string[]; endpoint?: string; env?: Record<string, string>; enabled?: boolean }) => request<McpConnection>(`/mcp-connections/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteMcpConnection: (id: string) => request<void>(`/mcp-connections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -174,6 +260,36 @@ export const studioApi = {
   getNode: (id: string) => request<NodeDetail>(`/nodes/${encodeURIComponent(id)}`),
   updateNode: (id: string, payload: { name?: string; enabled?: boolean }) => request<NodeConnection>(`/nodes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteNode: (id: string) => request<void>(`/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  disconnectNode: (id: string) => request<NodeConnection>(`/nodes/${encodeURIComponent(id)}/disconnect`, { method: 'POST' }),
+  getLocalExecutorLauncherHealth: requestLocalExecutorLauncherHealth,
+  waitForManagedLocalExecutorOnline,
+  startLocalExecutor: async (workspace?: string) => {
+    const health = await requestLocalExecutorLauncherHealth()
+    if (!health.reachable) {
+      throw new Error(
+        `Local executor launcher is not reachable at ${LOCAL_EXECUTOR_LAUNCHER_URL}. Start the local launcher on this machine, then try again.`,
+      )
+    }
+    let response: Response
+    try {
+      response = await fetch(`${LOCAL_EXECUTOR_LAUNCHER_URL}/start`, {
+        method: 'POST',
+        mode: 'cors',
+        signal: AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+        headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace: workspace?.trim() || null }),
+      })
+    } catch {
+      throw new Error(
+        `Local executor launcher is not reachable at ${LOCAL_EXECUTOR_LAUNCHER_URL}. Start the local launcher on this machine, then try again.`,
+      )
+    }
+    const payload = await response.json().catch(() => ({})) as { message?: string; error?: string }
+    if (!response.ok) {
+      throw new Error(payload.message ?? payload.error ?? `Local executor launcher returned HTTP ${response.status}.`)
+    }
+    return payload
+  },
   rotateNodeCredentials: (id: string) => request<RotateNodeSecretResult>(`/nodes/${encodeURIComponent(id)}/credentials/rotate`, { method: 'POST' }),
   setNodeSystemAccess: (nodeId: string, enabled: boolean) => request<void>(`/nodes/${encodeURIComponent(nodeId)}/system-access`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   updateNodeTool: (nodeId: string, toolName: string, payload: { enabled?: boolean; requiresApproval?: boolean }) => request<NodeTool>(`/nodes/${encodeURIComponent(nodeId)}/tools/${encodeURIComponent(toolName)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -183,7 +299,8 @@ export const studioApi = {
   decideToolApproval: (id: string, approved: boolean) => request(`/tool-approvals/${encodeURIComponent(id)}/decision`, { method: 'POST', body: JSON.stringify({ approved }) }),
   setModelEnabled: (id: string, enabled: boolean) => request<ModelProfile>(`/models/${encodeURIComponent(id)}/status`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   setDefaultModel: (modelProfileId: string) => request<{ defaultModelProfileId: string }>('/models/settings/default', { method: 'PATCH', body: JSON.stringify({ modelProfileId }) }),
-  getConversation: (id: string) => request<Conversation>(`/conversations/${id}`),
+  getConversation: (id: string) => request<Conversation>(`/conversations/${encodeURIComponent(id)}`),
+  archiveConversation: (id: string) => request<Conversation>(`/conversations/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
   createConversation: (title: string) => request<{ id: string }>('/conversations', {
     method: 'POST',
     body: JSON.stringify({ title }),

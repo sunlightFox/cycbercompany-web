@@ -11,8 +11,7 @@ npm run dev
 
 ## Run with Docker
 
-Start the frontend, Spring Boot backend, and SearXNG search service from the
-frontend project root:
+Start the frontend and Spring Boot backend from the frontend project root:
 
 ```powershell
 docker compose up -d --build
@@ -33,15 +32,15 @@ Stop it with `docker compose stop`. To rebuild dependencies after changing
 `package-lock.json`, run `docker compose up -d --build`.
 
 The frontend proxies `/api` to a loopback-only backend in the same Docker
-network namespace, and the backend uses the `searxng` service internally. Supply the model key through the shell before
-starting the stack:
+network namespace, and the backend uses Tavily automatically when `TAVILY_API_KEY`
+is present. Supply the model key through the shell before starting the stack:
 
 ```powershell
 $env:EDGEFN_API_KEY = 'sk-...'
 docker compose up -d --build
 ```
 
-The development server proxies `/api` to `http://localhost:8080`. Set `VITE_DEV_PROXY_TARGET` for another local backend port. Set `VITE_API_BASE_URL` to the deployed backend API root when the frontend and backend are hosted on different origins. Set `VITE_NODE_SERVER_URL` when the managed local executor should connect directly to a loopback backend rather than through the frontend origin, for example `http://127.0.0.1:8000` for the Python backend.
+The development server proxies `/api` to `http://localhost:8080`. Set `VITE_DEV_PROXY_TARGET` for another local backend port; the source-checkout executor command uses the same target in development instead of pointing a node at the Vite page. Set `VITE_API_BASE_URL` to the deployed backend API root when the frontend and backend are hosted on different origins. Set `VITE_NODE_SERVER_URL` when the managed local executor should connect directly to a loopback backend rather than through the frontend origin, for example `http://127.0.0.1:8000` for the Python backend. Release builds can set `VITE_WINDOWS_COMPANION_DOWNLOAD_URL` to show the packaged Windows companion instead of the source-checkout Gradle command when the local launcher is unavailable.
 
 ## Product rules
 
