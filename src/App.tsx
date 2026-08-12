@@ -1063,7 +1063,6 @@ function App() {
       capabilityState.nodeId &&
       (nodesQuery.isSuccess &&
         (!selectedNode ||
-          selectedNode.kind === "MANAGED_LOCAL" ||
           !selectedNode.enabled ||
           selectedNode.status?.toUpperCase() !== "ONLINE"))
     )
@@ -3749,7 +3748,6 @@ function Composer({
   }, [textareaRef, value]);
   const registeredOnlineNodes = (nodesQuery.data ?? []).filter(
     (node) =>
-      node.kind !== "MANAGED_LOCAL" &&
       node.enabled &&
       node.status?.toUpperCase() === "ONLINE",
   );

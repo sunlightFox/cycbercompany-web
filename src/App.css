@@ -976,6 +976,7 @@ button.step-row:hover, button.step-row:focus-visible { color: var(--ink); backgr
 .knowledge-detail-heading p { margin: 5px 0 0; color: var(--ink-muted); font-size: 12px; line-height: 1.45; }
 .knowledge-detail-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; flex: 0 0 auto; }
 .knowledge-detail-actions .secondary-button.is-active { background: var(--surface-muted); color: var(--ink); }
+.file-import-input { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .knowledge-import-form { background: var(--surface); }
 .knowledge-runtime-summary { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
 .knowledge-runtime-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }

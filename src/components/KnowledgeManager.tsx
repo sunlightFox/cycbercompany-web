@@ -342,8 +342,9 @@ export default function KnowledgeManager({
             <input
               ref={fileInputRef}
               type="file"
-              hidden
+              className="file-import-input"
               multiple
+              disabled={busy}
               accept=".pdf,.docx,.xlsx,.pptx,.txt,.md,.markdown,.csv,.tsv,.json,.html,.htm,.xml,.yml,.yaml,.log,text/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation"
               onChange={(event) => {
                 handleFiles(Array.from(event.target.files ?? []));
