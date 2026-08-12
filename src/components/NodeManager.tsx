@@ -475,6 +475,7 @@ export default function NodeManager({
           available={managedLocalExecutorAvailable}
           launcherChecking={localExecutorLauncherChecking}
           launcherAvailable={localExecutorLauncherAvailable}
+          launcherStarting={localExecutorLauncherQuery.data?.starting ?? false}
           launcherWorkspace={localExecutorLauncherQuery.data?.workspace}
           onDisconnect={() => {
             if (!managedLocalExecutor) return;
@@ -534,6 +535,7 @@ export default function NodeManager({
             available={managedLocalExecutorAvailable}
             launcherChecking={localExecutorLauncherChecking}
             launcherAvailable={localExecutorLauncherAvailable}
+            launcherStarting={localExecutorLauncherQuery.data?.starting ?? false}
             launcherWorkspace={localExecutorLauncherQuery.data?.workspace}
             onDisconnect={() => {
               if (!managedLocalExecutor) return;
@@ -660,6 +662,7 @@ function ManagedLocalExecutorStatus({
   available,
   launcherChecking,
   launcherAvailable,
+  launcherStarting,
   launcherWorkspace,
   onDisconnect,
   onStart,
@@ -676,6 +679,7 @@ function ManagedLocalExecutorStatus({
   available: boolean;
   launcherChecking: boolean;
   launcherAvailable: boolean;
+  launcherStarting: boolean;
   launcherWorkspace?: string;
   onDisconnect: () => void;
   onStart: (workspace: string) => void;
@@ -692,8 +696,11 @@ function ManagedLocalExecutorStatus({
     setWorkspace((current) => current.trim() ? current : launcherWorkspace);
   }, [launcherWorkspace]);
   const online = Boolean(available && node?.enabled && node.status?.toUpperCase() === "ONLINE");
+  const connecting = !online && launcherStarting;
   const status = !available
     ? t("localExecutorUnavailable")
+    : connecting
+      ? t("localExecutorConnecting")
     : !node
     ? t("localExecutorUnprovisioned")
     : !node.enabled
@@ -777,8 +784,8 @@ function ManagedLocalExecutorStatus({
         {!online && available ? (
           <div className="local-executor-launch">
             <div>
-              <strong>{t("localExecutorStartTitle")}</strong>
-              <p>{launcherAvailable ? t("localExecutorOneClickHint") : installerAvailable ? t("localExecutorInstallHint") : t("localExecutorStartHint")}</p>
+              <strong>{connecting ? t("localExecutorConnecting") : t("localExecutorStartTitle")}</strong>
+              <p>{connecting ? t("localExecutorConnectingHint") : launcherAvailable ? t("localExecutorOneClickHint") : installerAvailable ? t("localExecutorInstallHint") : t("localExecutorStartHint")}</p>
             </div>
             {!installerAvailable ? <label>
               {t("localExecutorWorkspace")}
@@ -825,15 +832,16 @@ function ManagedLocalExecutorStatus({
                 type="button"
                 disabled={
                   starting ||
+                  connecting ||
                   launcherChecking ||
                   !launcherAvailable ||
                   !workspaceConfigured
                 }
                 onClick={() => onStart(workspace)}
-                aria-busy={starting}
+                aria-busy={starting || connecting}
               >
-                {starting ? <LoaderCircle size={14} className="spin" /> : <Play size={14} />}
-                {starting ? t("localExecutorStarting") : t("localExecutorStart")}
+                {starting || connecting ? <LoaderCircle size={14} className="spin" /> : <Play size={14} />}
+                {starting ? t("localExecutorStarting") : connecting ? t("localExecutorConnecting") : t("localExecutorStart")}
               </button>
             </div> : null}
             {startError ? (
@@ -843,7 +851,7 @@ function ManagedLocalExecutorStatus({
                 <button
                   className="connection-retry"
                   type="button"
-                  disabled={starting || !launcherAvailable || !workspaceConfigured}
+                  disabled={starting || connecting || !launcherAvailable || !workspaceConfigured}
                   onClick={() => onStart(workspace)}
                 >
                   {t("retry")}

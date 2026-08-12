@@ -63,7 +63,7 @@ export default function ModelManager({
   t: (key: string) => string;
 }) {
   const queryClient = useQueryClient();
-  const [section, setSection] = useState("installed");
+  const [section, setSection] = useState<"installed" | "presets">("installed");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
@@ -87,7 +87,12 @@ export default function ModelManager({
       setTestResult(null);
       setError("");
     },
-    onError: () => setError(t("modelSaveFailed")),
+    onError: (failure) =>
+      setError(
+        failure instanceof Error && failure.message
+          ? failure.message
+          : t("modelSaveFailed"),
+      ),
   });
   const deleteMutation = useMutation({
     mutationFn: studioApi.deleteModel,
@@ -144,6 +149,7 @@ export default function ModelManager({
         : emptyModelForm,
     );
     setEditingId(model?.id ?? null);
+    setSection("installed");
     setEditorOpen(true);
     setSavedModelId(null);
     setTestResult(null);
@@ -237,7 +243,7 @@ export default function ModelManager({
           {error}
         </div>
       ) : null}
-      {section === "installed" ? (
+      {!editorOpen && section === "installed" ? (
         <div className="model-installed">
           <div className="model-toolbar">
             <span>
@@ -297,13 +303,24 @@ export default function ModelManager({
                     </div>
                   </div>
                   <div className="model-profile-actions">
-                    <IconButton
-                      label={t("testModel")}
-                      onClick={() => testMutation.mutate(model.id)}
-                      disabled={testMutation.isPending}
-                    >
-                      <PlugZap size={14} />
-                    </IconButton>
+                    {!model.apiKeyConfigured ? (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => openEditor(model)}
+                      >
+                        <Pencil size={14} />
+                        {t("configureModelKey")}
+                      </button>
+                    ) : (
+                      <IconButton
+                        label={t("testModel")}
+                        onClick={() => testMutation.mutate(model.id)}
+                        disabled={testMutation.isPending}
+                      >
+                        <PlugZap size={14} />
+                      </IconButton>
+                    )}
                     <IconButton
                       label={t("editModel")}
                       onClick={() => openEditor(model)}
@@ -357,7 +374,7 @@ export default function ModelManager({
             </div>
           ) : null}
         </div>
-      ) : (
+      ) : !editorOpen && section === "presets" ? (
         <div className="model-preset-list">
           {presetsQuery.isLoading ? (
             <div className="manager-placeholder">
@@ -409,7 +426,7 @@ export default function ModelManager({
             </div>
           )}
         </div>
-      )}
+      ) : null}
       {editorOpen ? (
         <div className="model-editor">
           <div className="model-editor-header">

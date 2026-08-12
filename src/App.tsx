@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   ArrowUp,
   Archive,
+  Activity,
   Bot,
   Check,
   ChevronDown,
@@ -13,6 +14,7 @@ import {
   CircleAlert,
   CircleStop,
   Copy,
+  Cpu,
   Database,
   Download,
   FileText,
@@ -22,10 +24,13 @@ import {
   History,
   LoaderCircle,
   Menu,
+  MemoryStick,
   MoreHorizontal,
+  Monitor,
   Moon,
   PanelLeftClose,
   Paperclip,
+  Plug,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -35,10 +40,13 @@ import {
   ShieldAlert,
   ShieldCheck,
   Sparkles,
+  Server,
   Sun,
   TerminalSquare,
+  Target,
   Trash2,
   Wrench,
+  UserRound,
   X,
   Zap,
 } from "lucide-react";
@@ -78,6 +86,7 @@ import type {
   SkillPreflight,
   StudioMessage,
   Tool,
+  UserPersona,
 } from "./types";
 import "./App.css";
 
@@ -124,6 +133,8 @@ const SkillsManager = lazy(() => import("./components/SkillsManager"));
 const KnowledgeManager = lazy(() => import("./components/KnowledgeManager"));
 const ModelManager = lazy(() => import("./components/ModelManager"));
 const NodeManager = lazy(() => import("./components/NodeManager"));
+const MemoryManager = lazy(() => import("./components/MemoryManager"));
+const PersonaManager = lazy(() => import("./components/PersonaManager"));
 const CitationDrawer = lazy(() => import("./components/CitationDrawer"));
 const RunAuditDrawer = lazy(() => import("./components/RunAuditDrawer"));
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
@@ -147,7 +158,8 @@ function readHistory(): HistoryEntry[] {
       localStorage.getItem(HISTORY_STORAGE_KEY) ?? "[]",
     );
     return Array.isArray(parsed)
-      ? parsed
+      ? sortHistoryEntries(
+          parsed
           .filter((item): item is HistoryEntry =>
             Boolean(item?.id && item?.title && item?.updatedAt),
           )
@@ -157,18 +169,24 @@ function readHistory(): HistoryEntry[] {
             updatedAt: item.updatedAt,
             archived: Boolean(item.archived),
             archivedAt: typeof item.archivedAt === "string" ? item.archivedAt : null,
-          }))
-          .slice(0, 30)
+          })),
+        ).slice(0, 30)
       : [];
   } catch {
     return [];
   }
 }
 
+function sortHistoryEntries(entries: HistoryEntry[]) {
+  return [...entries].sort((left, right) =>
+    right.updatedAt.localeCompare(left.updatedAt),
+  );
+}
+
 function writeHistory(entries: HistoryEntry[]) {
   localStorage.setItem(
     HISTORY_STORAGE_KEY,
-    JSON.stringify(entries.slice(0, 30)),
+    JSON.stringify(sortHistoryEntries(entries).slice(0, 30)),
   );
 }
 
@@ -254,7 +272,8 @@ function isNetworkFailure(error: unknown) {
 function isLocalExecutorNotReady(error: unknown) {
   return error instanceof StudioApiError
     && error.status === 400
-    && /local computer control is not ready/i.test(error.message);
+    && (error.code === "LOCAL_COMPUTER_CONTROL_NOT_READY"
+      || /local computer control is not ready/i.test(error.message));
 }
 
 function localExecutorStartFailureHint(error: unknown, t: (key: string) => string) {
@@ -499,6 +518,8 @@ function App() {
     (state) => state.setBackendAvailable,
   );
   const [prompt, setPrompt] = useState("");
+  const [selectedModelProfileId, setSelectedModelProfileId] = useState<string | null>(null);
+  const [selectedPersonaId, setSelectedPersonaId] = useState<string | null>(null);
   const [, setManagedRunIds] = useState<string[]>([]);
   const [stoppingRunIds, setStoppingRunIds] = useState<string[]>([]);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
@@ -716,9 +737,16 @@ function App() {
   const currentAgent =
     availableAgents.find((agent) => agent.id === selectedAgentId) ??
     availableAgents[0];
+  const activeModelProfileId =
+    selectedModelProfileId ?? currentAgent?.defaultModelProfileId ?? defaultModelProfileId;
+  useEffect(() => {
+    const modelList = modelsQuery.data ?? [];
+    if (selectedModelProfileId && modelList.some((model) => model.id === selectedModelProfileId)) return;
+    setSelectedModelProfileId(defaultModelProfileId ?? currentAgent?.defaultModelProfileId ?? null);
+  }, [currentAgent?.defaultModelProfileId, defaultModelProfileId, modelsQuery.data, selectedModelProfileId]);
   const modelReady = availableModels.some(
     (model) =>
-      model.id === (currentAgent?.defaultModelProfileId ?? defaultModelProfileId) &&
+      model.id === activeModelProfileId &&
       model.enabled &&
       model.apiKeyConfigured &&
       model.capabilities.includes("TEXT"),
@@ -741,6 +769,12 @@ function App() {
     modelsQuery.isSuccess &&
     !agentsQuery.isError &&
     !modelsQuery.isError;
+  const personasQuery = useQuery({
+    queryKey: ["personas"],
+    queryFn: studioApi.listPersonas,
+    enabled: backendAvailable,
+    retry: 1,
+  });
   const backendConnecting =
     !backendAvailable &&
     !systemStatusQuery.isError &&
@@ -812,6 +846,7 @@ function App() {
       rememberConversation(conversation.id, conversation.title, {
         archived: conversation.archived,
         archivedAt: conversation.archivedAt ?? null,
+        preserveUpdatedAt: true,
       });
       clearAttachments();
       setComposerNotice(null);
@@ -920,6 +955,9 @@ function App() {
       ? executionMode === "PERSONAL_LOCAL" ? 5_000 : 15_000
       : false,
   });
+  const selectedNode = (nodesQuery.data ?? []).find(
+    (node) => node.id === capabilityState.nodeId,
+  );
   const selectedCitation = messages
     .flatMap((message) => message.citations ?? [])
     .find((citation) => citation.id === sourceCitationId);
@@ -952,6 +990,34 @@ function App() {
     ? historyEntries.find((entry) => entry.id === conversationId)
     : undefined;
   const currentConversationArchived = Boolean(currentHistory?.archived);
+  const currentPersona = (personasQuery.data ?? []).find(
+    (persona) => persona.id === selectedPersonaId,
+  );
+  const selectPersonaMutation = useMutation({
+    mutationFn: async ({ personaId }: { personaId: string | null; previousPersonaId: string | null }) => {
+      if (!conversationId) return null;
+      return studioApi.selectConversationPersona(conversationId, personaId);
+    },
+    onSuccess: (conversation) => {
+      if (conversation) setSelectedPersonaId(conversation.personaId ?? null);
+    },
+    onError: (_error, variables) => {
+      setSelectedPersonaId(variables.previousPersonaId);
+      setComposerNotice(t("personaSaveFailed"));
+    },
+  });
+  const handlePersonaSelect = useCallback((personaId: string | null) => {
+    if (personaId === selectedPersonaId) return;
+    if (currentConversationArchived) {
+      setComposerNotice(t("personaArchivedDisabled"));
+      return;
+    }
+    const previousPersonaId = selectedPersonaId;
+    setSelectedPersonaId(personaId);
+    if (conversationId) {
+      selectPersonaMutation.mutate({ personaId, previousPersonaId });
+    }
+  }, [conversationId, currentConversationArchived, selectPersonaMutation, selectedPersonaId, t]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1027,22 +1093,29 @@ function App() {
     (
       id: string,
       title: string,
-      meta?: { archived?: boolean; archivedAt?: string | null },
+      meta?: {
+        archived?: boolean;
+        archivedAt?: string | null;
+        preserveUpdatedAt?: boolean;
+      },
     ) => {
       setHistoryEntries((current) => {
         const existing = current.find((entry) => entry.id === id);
-        const next = [
+        const updatedAt = meta?.preserveUpdatedAt && existing
+          ? existing.updatedAt
+          : new Date().toISOString();
+        const next = sortHistoryEntries([
           {
             id,
             title: (existing?.title ?? title) || t("newTask"),
-            updatedAt: new Date().toISOString(),
+            updatedAt,
             archived: meta?.archived ?? existing?.archived ?? false,
             archivedAt:
               meta?.archivedAt ??
               (meta?.archived === false ? null : existing?.archivedAt ?? null),
           },
           ...current.filter((entry) => entry.id !== id),
-        ];
+        ]);
         writeHistory(next);
         return next;
       });
@@ -1053,6 +1126,7 @@ function App() {
   const resetTask = useCallback(() => {
     conversationLoadRef.current += 1;
     setConversationId(null);
+    setSelectedPersonaId(null);
     setMessages([]);
     setPrompt("");
     setApprovalMode("on-request");
@@ -1066,11 +1140,16 @@ function App() {
     setComposerNotice(null);
     setSourceCitationId(null);
     setExpandedMessageId(null);
+    setSearchOpen(false);
+    setHistoryOpen(false);
+    setAuditRunId(null);
+    setSettingsOpen(false);
     window.setTimeout(() => textareaRef.current?.focus(), 0);
   }, [
     clearAttachments,
     setConversationId,
     setMessages,
+    setSettingsOpen,
     setSourceCitationId,
   ]);
 
@@ -1381,11 +1460,12 @@ function App() {
       if (ensureConversationRef.current) return ensureConversationRef.current;
       // Do not allow an older history restore to replace these optimistic messages.
       conversationLoadRef.current += 1;
-      ensureConversationRef.current = studioApi.createConversation(title || t("newTask")).then((result) => {
+      ensureConversationRef.current = studioApi.createConversation(title || t("newTask"), selectedPersonaId).then((result) => {
         // The composer already inserted the optimistic user and assistant messages.
         // Suppress the automatic empty-history restoration for this brand-new conversation.
         restoredConversationRef.current = result.id;
         setConversationId(result.id);
+        setSelectedPersonaId(result.personaId ?? null);
         writeConversationApprovalMode(result.id, approvalMode);
         rememberConversation(result.id, title);
         return result.id;
@@ -1394,7 +1474,7 @@ function App() {
       });
       return ensureConversationRef.current;
     },
-    [approvalMode, rememberConversation, setConversationId, t],
+    [approvalMode, rememberConversation, selectedPersonaId, setConversationId, t],
   );
 
   const openConversation = useCallback(
@@ -1406,10 +1486,12 @@ function App() {
       try {
         const conversation = await studioApi.getConversation(id);
         setConversationId(conversation.id);
+        setSelectedPersonaId(conversation.personaId ?? null);
         setApprovalMode(readConversationApprovalMode(conversation.id));
         rememberConversation(conversation.id, conversation.title, {
           archived: conversation.archived,
           archivedAt: conversation.archivedAt ?? null,
+          preserveUpdatedAt: true,
         });
         let runs: RunView[] = [];
         try {
@@ -1732,8 +1814,7 @@ function App() {
           conversationId: conversation,
           text: runInput,
           agentId: currentAgent?.id,
-          modelProfileId:
-            currentAgent?.defaultModelProfileId ?? defaultModelProfileId,
+          modelProfileId: activeModelProfileId,
           ...(attachmentIds.length ? { attachmentIds } : {}),
           clientRequestId,
           ...selectedCapabilities,
@@ -1925,10 +2006,9 @@ function App() {
       capabilityState,
       currentConversationArchived,
       clearSentAttachments,
-      currentAgent?.defaultModelProfileId,
       currentAgent?.defaultSkillIds,
       currentAgent?.id,
-      defaultModelProfileId,
+      activeModelProfileId,
       ensureConversation,
       executionMode,
       finishRun,
@@ -2276,7 +2356,7 @@ function App() {
             aria-hidden={settingsOpen || sidebarOpen}
             inert={settingsOpen || sidebarOpen || undefined}
           >
-          <header className="topbar">
+          <header className="topbar reference-topbar">
             <div className="topbar-leading">
               <IconButton
                 label={t("workspace")}
@@ -2287,55 +2367,115 @@ function App() {
               >
                 <Menu size={18} />
               </IconButton>
-              <span className="conversation-title" aria-label={currentHistory?.title ?? t("newTask")}>
-                <span className="conversation-title-copy">{currentHistory?.title ?? t("newTask")}</span>
-              </span>
+              <h1 className="studio-wordmark">Spring Agent Studio</h1>
             </div>
             <div className="topbar-actions">
-              <DropdownMenu.Root>
-                <DropdownMenu.Trigger asChild>
-                  <button className="agent-trigger" type="button" aria-label={t("agents")} title={t("agents")}>
-                    <span className="agent-avatar"><Bot size={15} /></span>
-                    <span className="agent-trigger-copy">
-                      <small>{t("agents")}</small>
-                      <strong>{currentAgent?.name ?? t("agents")}</strong>
-                    </span>
-                    <ChevronDown size={14} />
-                  </button>
-                </DropdownMenu.Trigger>
-                <DropdownMenu.Portal>
-                  <DropdownMenu.Content className="menu" align="end" sideOffset={8}>
-                    <DropdownMenu.Label className="menu-label">{t("agents")}</DropdownMenu.Label>
-                    {availableAgents.map((agent) => (
-                      <DropdownMenu.Item
-                        className="menu-item"
-                        key={agent.id}
-                        onSelect={() => setSelectedAgentId(agent.id)}
-                      >
-                        <Bot size={15} />
-                        {agent.name}
-                        {agent.id === currentAgent?.id ? <Check size={15} className="menu-item-check" /> : null}
+              <div className="workspace-switchers" aria-label={t("workspace")}>
+                <DropdownMenu.Root>
+                  <DropdownMenu.Trigger asChild>
+                    <button className="topbar-switcher" type="button" aria-label={t("agents")}>
+                      <Bot size={17} />
+                      <span className="topbar-switcher-copy">
+                        <small>{t("agents")}</small>
+                        <strong>{currentAgent?.name ?? t("agentEmptyState")}</strong>
+                      </span>
+                      <ChevronDown size={14} />
+                    </button>
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content className="menu workspace-switcher-menu" align="end" sideOffset={8}>
+                      <DropdownMenu.Label className="menu-label">{t("agents")}</DropdownMenu.Label>
+                      {availableAgents.length ? availableAgents.map((agent) => (
+                        <DropdownMenu.Item className="menu-item" key={agent.id} onSelect={() => setSelectedAgentId(agent.id)}>
+                          <Bot size={15} />
+                          {agent.name}
+                          {agent.id === currentAgent?.id ? <Check size={15} className="menu-item-check" /> : null}
+                        </DropdownMenu.Item>
+                      )) : (
+                        <DropdownMenu.Item className="menu-item" disabled><CircleAlert size={15} />{t("agentEmptyState")}</DropdownMenu.Item>
+                      )}
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+                <DropdownMenu.Root>
+                  <DropdownMenu.Trigger asChild>
+                    <button
+                      className="topbar-switcher"
+                      type="button"
+                      aria-label={t("personaSelector")}
+                      disabled={selectPersonaMutation.isPending || currentConversationArchived}
+                    >
+                      <UserRound size={17} />
+                      <span className="topbar-switcher-copy">
+                        <small>{t("personaSelector")}</small>
+                        <strong>{currentPersona?.name ?? t("personaNone")}</strong>
+                      </span>
+                      <ChevronDown size={14} />
+                    </button>
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content className="menu workspace-switcher-menu" align="end" sideOffset={8}>
+                      <DropdownMenu.Label className="menu-label">{t("personaSelector")}</DropdownMenu.Label>
+                      <DropdownMenu.Item className="menu-item persona-menu-hint" disabled>
+                        {t("personaPermissionHint")}
                       </DropdownMenu.Item>
-                    ))}
-                    <DropdownMenu.Separator className="menu-separator" />
-                    <DropdownMenu.Item className="menu-item" onSelect={() => openConfiguration("agents")}>
-                      <Settings2 size={15} /> {t("manage")}
-                    </DropdownMenu.Item>
-                  </DropdownMenu.Content>
-                </DropdownMenu.Portal>
-              </DropdownMenu.Root>
-              <button
-                className="manage-button"
-                type="button"
-                onClick={(event) => openConfiguration("agents", event.currentTarget)}
-              >
-                <Settings2 size={15} />
-                {t("manage")}
-              </button>
+                      <DropdownMenu.Item className="menu-item" onSelect={() => handlePersonaSelect(null)}>
+                        <UserRound size={15} />
+                        {t("personaNone")}
+                        {!selectedPersonaId ? <Check size={15} className="menu-item-check" /> : null}
+                      </DropdownMenu.Item>
+                      {personasQuery.isLoading ? (
+                        <DropdownMenu.Item className="menu-item" disabled>
+                          <LoaderCircle size={15} className="spin" />{t("personaLoading")}
+                        </DropdownMenu.Item>
+                      ) : personasQuery.data?.length ? personasQuery.data.map((persona: UserPersona) => (
+                        <DropdownMenu.Item className="menu-item" key={persona.id} onSelect={() => handlePersonaSelect(persona.id)}>
+                          <UserRound size={15} />
+                          {persona.name}
+                          {persona.defaultPersona ? <span className="persona-default-marker">{t("personaDefault")}</span> : null}
+                          {persona.id === selectedPersonaId ? <Check size={15} className="menu-item-check" /> : null}
+                        </DropdownMenu.Item>
+                      )) : (
+                        <DropdownMenu.Item className="menu-item" disabled>
+                          <CircleAlert size={15} />{t("personaEmpty")}
+                        </DropdownMenu.Item>
+                      )}
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+                <DropdownMenu.Root onOpenChange={(open) => { if (open) setCapabilityDataRequested(true); }}>
+                  <DropdownMenu.Trigger asChild>
+                    <button className="topbar-switcher" type="button" aria-label={t("nodes")}>
+                      {selectedNode ? <Server size={17} /> : <Monitor size={17} />}
+                      <span className="topbar-switcher-copy">
+                        <small>{t("nodes")}</small>
+                        <strong>{selectedNode?.name ?? (executionMode === "PERSONAL_LOCAL" ? t("localExecutor") : t("noExecutionNode"))}</strong>
+                      </span>
+                      <ChevronDown size={14} />
+                    </button>
+                  </DropdownMenu.Trigger>
+                  <DropdownMenu.Portal>
+                    <DropdownMenu.Content className="menu workspace-switcher-menu" align="end" sideOffset={8}>
+                      <DropdownMenu.Label className="menu-label">{t("nodes")}</DropdownMenu.Label>
+                      <DropdownMenu.Item className="menu-item" onSelect={() => setCapabilityState((current) => ({ ...current, nodeId: undefined }))}>
+                        <Monitor size={15} />{t("localExecutor")}
+                        {!capabilityState.nodeId ? <Check size={15} className="menu-item-check" /> : null}
+                      </DropdownMenu.Item>
+                      {(nodesQuery.data ?? []).filter((node) => node.enabled).map((node) => (
+                        <DropdownMenu.Item className="menu-item" key={node.id} onSelect={() => setCapabilityState((current) => ({ ...current, nodeId: node.id }))}>
+                          <Server size={15} />{node.name}
+                          {node.id === capabilityState.nodeId ? <Check size={15} className="menu-item-check" /> : null}
+                        </DropdownMenu.Item>
+                      ))}
+                      {!nodesQuery.data?.length ? <DropdownMenu.Item className="menu-item" disabled><CircleAlert size={15} />{t("noExecutionNode")}</DropdownMenu.Item> : null}
+                    </DropdownMenu.Content>
+                  </DropdownMenu.Portal>
+                </DropdownMenu.Root>
+              </div>
               <DropdownMenu.Root>
                 <DropdownMenu.Trigger asChild>
                   <button
-                    className="icon-button"
+                    className="icon-button reference-settings-trigger"
                     aria-label={t("more")}
                     type="button"
                   >
@@ -2427,6 +2567,11 @@ function App() {
             onScroll={handleConversationScroll}
           >
             <div className={`message-feed ${messages.length === 0 ? "is-empty" : ""}`}>
+              {messages.length === 0 ? (
+                <div className="empty-conversation" aria-label={t("workspace")}>
+                  <h1>{t("askStudio")}</h1>
+                </div>
+              ) : null}
               {messages.map((message) => {
                 return (
                   <Fragment key={message.id}>
@@ -2446,6 +2591,7 @@ function App() {
                           : retryMessage(message)
                       }
                       onCancelRun={handleCancelRun}
+                      onAudit={(runId) => setAuditRunId(runId)}
                       onApproval={handleApproval}
                       readOnly={currentConversationArchived}
                       approving={approvingApprovalId === message.approvalId}
@@ -2504,6 +2650,9 @@ function App() {
             skillsQuery={skillsQuery}
             mcpQuery={mcpQuery}
             nodesQuery={nodesQuery}
+            models={availableModels}
+            activeModelProfileId={activeModelProfileId}
+            onModelChange={setSelectedModelProfileId}
             capabilityState={capabilityState}
             empty={messages.length === 0}
             onCapabilityChange={handleCapabilityChange}
@@ -2543,8 +2692,8 @@ function App() {
               audit={auditQuery.data}
               workflow={auditWorkflowQuery.data}
               artifacts={auditQuery.data?.artifacts}
-              loading={auditEvidenceQuery.isLoading || auditQualityQuery.isLoading || auditQuery.isLoading || auditWorkflowQuery.isLoading}
-              error={auditEvidenceQuery.isError || auditQualityQuery.isError || auditQuery.isError || auditWorkflowQuery.isError}
+              loading={auditQuery.isLoading}
+              error={auditQuery.isError}
               onDownload={(artifact) => void handleDownloadArtifact(artifact)}
               onClose={() => setAuditRunId(null)}
               t={t}
@@ -2615,25 +2764,24 @@ function Sidebar({
   };
   const openTask = () => {
     onNewTask();
-    closeNavigation();
   };
   const openSearch = () => {
-    closeNavigation();
     onSearch();
   };
-  const openHistory = () => {
-    closeNavigation();
+  const expandHistory = () => {
+    if (!mobileOpen) onExpandedChange(true);
+  };
+  const openHistoryDialog = () => {
     onHistory();
   };
   const openManager = (event: React.MouseEvent<HTMLButtonElement>) => {
-    closeNavigation();
     onManage(event.currentTarget);
   };
   const openSettings = (event: React.MouseEvent<HTMLButtonElement>) => {
-    closeNavigation();
     onSettings(event.currentTarget);
   };
-  const recentEntries = historyEntries.slice(0, 5);
+  const recentEntries = historyEntries.slice(0, 12);
+  const hasMoreHistory = historyEntries.length > recentEntries.length;
   const panelOpen = expanded || mobileOpen;
 
   useEffect(() => {
@@ -2722,7 +2870,7 @@ function Sidebar({
         <RailButton label={t("search")} onClick={openSearch}>
           <Search size={18} />
         </RailButton>
-        <RailButton label={t("history")} onClick={openHistory}>
+        <RailButton label={t("history")} onClick={expandHistory} active={expanded}>
           <History size={18} />
         </RailButton>
       </nav>
@@ -2785,40 +2933,50 @@ function Sidebar({
                 <button
                   className="text-button"
                   type="button"
-                  onClick={openHistory}
+                  onClick={openHistoryDialog}
                 >
                   {t("more")}
                 </button>
               </div>
               {recentEntries.length ? (
-                <div className="recent-conversation-list">
-                  {recentEntries.map((entry) => (
-                    <button
-                      className={`recent-conversation ${entry.id === currentConversationId ? "is-current" : ""}`}
-                      type="button"
-                      key={entry.id}
-                      aria-label={entry.title}
-                      title={entry.title}
-                      onClick={() => {
-                        closeNavigation();
-                        onOpenConversation(entry.id);
-                      }}
-                    >
-                      <History size={15} />
-                      <span className="recent-conversation-copy">
-                        <span className="recent-conversation-title" aria-hidden="true">
-                          {entry.title}
-                        </span>
-                        {entry.archived ? (
-                          <span className="conversation-state-badge is-inline">
-                            <Archive size={11} />
-                            {t("archived")}
+                <>
+                  <div className="recent-conversation-list">
+                    {recentEntries.map((entry) => (
+                      <button
+                        className={`recent-conversation ${entry.id === currentConversationId ? "is-current" : ""}`}
+                        type="button"
+                        key={entry.id}
+                        aria-label={entry.title}
+                        title={entry.title}
+                        onClick={() => {
+                          onOpenConversation(entry.id);
+                        }}
+                      >
+                        <History size={15} />
+                        <span className="recent-conversation-copy">
+                          <span className="recent-conversation-title" aria-hidden="true">
+                            {entry.title}
                           </span>
-                        ) : null}
-                      </span>
+                          {entry.archived ? (
+                            <span className="conversation-state-badge is-inline">
+                              <Archive size={11} />
+                              {t("archived")}
+                            </span>
+                          ) : null}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {hasMoreHistory ? (
+                    <button
+                      className="text-button recent-conversation-more"
+                      type="button"
+                      onClick={openHistoryDialog}
+                    >
+                      {t("more")}
                     </button>
-                  ))}
-                </div>
+                  ) : null}
+                </>
               ) : (
                 <div className="recent-conversation-empty">
                   {t("noHistory")}
@@ -3050,6 +3208,10 @@ function HistoryDialog({
   const sorted = [...entries].sort((a, b) =>
     b.updatedAt.localeCompare(a.updatedAt),
   );
+  const openHistoryEntry = (id: string) => {
+    onOpenChange(false);
+    void onOpenConversation(id);
+  };
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -3074,7 +3236,7 @@ function HistoryDialog({
                     type="button"
                     key={entry.id}
                     className={`history-item ${entry.id === currentId ? "is-current" : ""}`}
-                    onClick={() => void onOpenConversation(entry.id)}
+                    onClick={() => openHistoryEntry(entry.id)}
                     disabled={Boolean(openingId)}
                     aria-busy={openingId === entry.id || undefined}
                   >
@@ -3133,6 +3295,7 @@ function MessageBlock({
   onCopy,
   onRetry,
   onCancelRun,
+  onAudit,
   onApproval,
   readOnly,
   approving,
@@ -3147,6 +3310,7 @@ function MessageBlock({
   onCopy: () => void;
   onRetry: () => void;
   onCancelRun: (runId: string) => void;
+  onAudit: (runId: string) => void;
   onApproval: (message: StudioMessage, approved: boolean) => void;
   readOnly: boolean;
   approving: boolean;
@@ -3183,6 +3347,7 @@ function MessageBlock({
       !message.runId.startsWith("pending-") &&
       (message.runState === "queued" || message.runState === "running" || waitingApproval),
   );
+  const canViewAudit = Boolean(message.runId && !message.runId.startsWith("pending-"));
   const failed = message.runState === "failed" || message.runState === "timedOut" || message.runState === "interrupted";
   const canRetry = Boolean(
     !readOnly &&
@@ -3381,7 +3546,7 @@ function MessageBlock({
           ))}
         </div>
       ) : null}
-      {message.content || canRetry || canCancel ? (
+      {message.content || canRetry || canCancel || canViewAudit ? (
         <div className="message-actions">
           {message.content ? (
             <IconButton label={copied ? t("copied") : t("copy")} onClick={onCopy}>
@@ -3391,6 +3556,11 @@ function MessageBlock({
           {canRetry ? (
             <IconButton label={t("retry")} onClick={onRetry}>
               <RotateCcw size={14} />
+            </IconButton>
+          ) : null}
+          {canViewAudit && message.runId ? (
+            <IconButton label={t("runDetails")} onClick={() => onAudit(message.runId!)}>
+              <Activity size={14} />
             </IconButton>
           ) : null}
           {canCancel && message.runId ? (
@@ -3509,10 +3679,13 @@ function Composer({
   skillsQuery,
   mcpQuery,
   nodesQuery,
+  models,
+  activeModelProfileId,
+  onModelChange,
   capabilityState,
   empty,
   onCapabilityChange,
-  onCapabilityMenuOpen: _onCapabilityMenuOpen,
+  onCapabilityMenuOpen,
   approvalMode,
   onApprovalModeChange,
   readOnly,
@@ -3550,6 +3723,9 @@ function Composer({
   skillsQuery: { data?: Skill[] };
   mcpQuery: { data?: McpConnection[] };
   nodesQuery: { data?: NodeConnection[] };
+  models: ModelProfile[];
+  activeModelProfileId?: string | null;
+  onModelChange: (modelId: string) => void;
   capabilityState: CapabilityState;
   empty: boolean;
   onCapabilityChange: (state: CapabilityState) => void;
@@ -3560,7 +3736,11 @@ function Composer({
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
+  const mentionStartRef = useRef<number | null>(null);
   const [dragActive, setDragActive] = useState(false);
+  const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  const [skillPickerQuery, setSkillPickerQuery] = useState("");
+  const [fileAccept, setFileAccept] = useState<string | undefined>(undefined);
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -3604,6 +3784,46 @@ function Composer({
       [chip.key]: capabilityState[chip.key].filter((id) => id !== chip.id),
     });
   };
+  const handlePromptChange = (nextValue: string, cursorPosition: number) => {
+    onChange(nextValue);
+    const beforeCursor = nextValue.slice(0, cursorPosition);
+    const mentionMatch = beforeCursor.match(/(^|\s)@([^\s@]*)$/);
+    if (!mentionMatch) {
+      mentionStartRef.current = null;
+      setSkillPickerQuery("");
+      setSkillPickerOpen(false);
+      return;
+    }
+    mentionStartRef.current = cursorPosition - mentionMatch[2].length - 1;
+    setSkillPickerQuery(mentionMatch[2]);
+    setSkillPickerOpen(true);
+  };
+  const handleSkillSelect = (skill: Skill) => {
+    const mentionStart = mentionStartRef.current;
+    const selected = capabilityState.skillIds.includes(skill.id);
+    onCapabilityChange({
+      ...capabilityState,
+      skillIds: selected && mentionStart === null
+        ? capabilityState.skillIds.filter((id) => id !== skill.id)
+        : selected
+          ? capabilityState.skillIds
+          : [...capabilityState.skillIds, skill.id],
+    });
+    if (mentionStart !== null) {
+      const textarea = textareaRef.current;
+      const cursorPosition = textarea?.selectionStart ?? value.length;
+      const nextValue = `${value.slice(0, mentionStart)}@${skill.name} ${value.slice(cursorPosition)}`;
+      onChange(nextValue);
+      window.setTimeout(() => {
+        const nextCursor = mentionStart + skill.name.length + 2;
+        textareaRef.current?.focus();
+        textareaRef.current?.setSelectionRange(nextCursor, nextCursor);
+      }, 0);
+      mentionStartRef.current = null;
+    }
+    setSkillPickerQuery("");
+    setSkillPickerOpen(false);
+  };
   return (
     <div className={`composer-wrap ${empty ? "is-empty-composer" : ""}`}>
       <div
@@ -3643,6 +3863,7 @@ function Composer({
           aria-hidden="true"
           tabIndex={-1}
           multiple
+          accept={fileAccept}
           disabled={readOnly}
           onChange={(event) => {
             if (readOnly) {
@@ -3703,7 +3924,7 @@ function Composer({
           <textarea
             ref={textareaRef}
             value={value}
-            onChange={(event) => onChange(event.target.value)}
+            onChange={(event) => handlePromptChange(event.target.value, event.target.selectionStart)}
             onPaste={(event) => {
               if (readOnly) return;
               const files = Array.from(event.clipboardData.files);
@@ -3720,19 +3941,52 @@ function Composer({
           />
         </div>
         <div className="composer-action-row">
-          <IconButton
-            label={t("attach")}
-            onClick={() => fileRef.current?.click()}
-            disabled={readOnly}
-          >
-            <Plus size={22} />
-          </IconButton>
+          <div className="composer-action-left">
+            <ComposerPlusMenu
+              disabled={readOnly}
+              t={t}
+              tools={builtInTools}
+              skills={skillsQuery.data ?? []}
+              mcpConnections={mcpQuery.data ?? []}
+              state={capabilityState}
+              onCapabilityChange={onCapabilityChange}
+              onOpen={onCapabilityMenuOpen}
+              onOpenFiles={(accept) => {
+                setFileAccept(accept);
+                window.setTimeout(() => fileRef.current?.click(), 0);
+              }}
+            />
+            <ApprovalModeMenu
+              approvalMode={approvalMode}
+              onApprovalModeChange={onApprovalModeChange}
+              t={t}
+              disabled={readOnly}
+            />
+            <SkillPickerMenu
+              skills={skillsQuery.data ?? []}
+              selectedSkillIds={capabilityState.skillIds}
+              query={skillPickerQuery}
+              open={skillPickerOpen}
+              onOpenChange={(open) => {
+                if (open) onCapabilityMenuOpen();
+                if (!open) mentionStartRef.current = null;
+                setSkillPickerOpen(open);
+                if (!open) setSkillPickerQuery("");
+              }}
+              onQueryChange={setSkillPickerQuery}
+              onSelect={handleSkillSelect}
+              disabled={readOnly}
+              t={t}
+              showTrigger={false}
+            />
+          </div>
           <div className="composer-action-controls">
-          <ApprovalModeMenu
-            approvalMode={approvalMode}
-            onApprovalModeChange={onApprovalModeChange}
-            t={t}
+          <ComposerModelMenu
+            models={models}
+            activeModelProfileId={activeModelProfileId}
+            onModelChange={onModelChange}
             disabled={readOnly}
+            t={t}
           />
           {running ? (
             <button
@@ -3812,6 +4066,295 @@ function Composer({
         ) : null}
       </div>
     </div>
+  );
+}
+
+function ComposerPlusMenu({
+  disabled,
+  t,
+  tools,
+  skills,
+  mcpConnections,
+  state,
+  onCapabilityChange,
+  onOpen,
+  onOpenFiles,
+}: {
+  disabled: boolean;
+  t: (key: string) => string;
+  tools: Tool[];
+  skills: Skill[];
+  mcpConnections: McpConnection[];
+  state: CapabilityState;
+  onCapabilityChange: (state: CapabilityState) => void;
+  onOpen: () => void;
+  onOpenFiles: (accept?: string) => void;
+}) {
+  const availableSkills = skills.filter((skill) => skill.enabled);
+  const availableConnections = mcpConnections.filter((connection) => connection.enabled);
+  const toggle = (key: CapabilityArrayKey, id: string, checked: boolean) =>
+    onCapabilityChange({
+      ...state,
+      [key]: checked
+        ? [...state[key], id]
+        : state[key].filter((value) => value !== id),
+    });
+  return (
+    <DropdownMenu.Root modal={false} onOpenChange={(open) => { if (open) onOpen(); }}>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          className="composer-plus-trigger"
+          aria-label={t("attachMenu")}
+          title={t("attachMenu")}
+          disabled={disabled}
+        >
+          <Plus size={22} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="menu composer-plus-menu" align="start" side="top" sideOffset={10}>
+          <DropdownMenu.Item className="composer-plus-item" onSelect={() => onOpenFiles()}>
+            <Paperclip size={18} />
+            <span>{t("filesAndImages")}</span>
+          </DropdownMenu.Item>
+          <DropdownMenu.Sub>
+            <DropdownMenu.SubTrigger className="composer-plus-item">
+              <Plug size={18} />
+              <span>{t("plugins")}</span>
+              <ChevronRight size={15} className="composer-plus-chevron" />
+            </DropdownMenu.SubTrigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.SubContent className="menu composer-plus-submenu" sideOffset={6}>
+                {availableConnections.length ? availableConnections.map((connection) => {
+                  const selected = state.mcpServerIds.includes(connection.id);
+                  return (
+                    <DropdownMenu.CheckboxItem
+                      key={connection.id}
+                      className="composer-plus-item"
+                      checked={selected}
+                      onCheckedChange={(checked) => toggle("mcpServerIds", connection.id, checked)}
+                    >
+                      <Plug size={16} />
+                      <span>{connection.name}</span>
+                      <DropdownMenu.ItemIndicator className="item-indicator"><Check size={14} /></DropdownMenu.ItemIndicator>
+                    </DropdownMenu.CheckboxItem>
+                  );
+                }) : (
+                  <DropdownMenu.Item className="composer-plus-item" disabled>
+                    <Plug size={16} />
+                    <span>{t("pluginsEmpty")}</span>
+                  </DropdownMenu.Item>
+                )}
+              </DropdownMenu.SubContent>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Sub>
+          <DropdownMenu.Sub>
+            <DropdownMenu.SubTrigger className="composer-plus-item">
+              <Sparkles size={18} />
+              <span>{t("skills")}</span>
+              <ChevronRight size={15} className="composer-plus-chevron" />
+            </DropdownMenu.SubTrigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.SubContent className="menu composer-plus-submenu" sideOffset={6}>
+                {availableSkills.length ? availableSkills.map((skill) => (
+                  <DropdownMenu.CheckboxItem
+                    key={skill.id}
+                    className="composer-plus-item"
+                    checked={state.skillIds.includes(skill.id)}
+                    onCheckedChange={(checked) => toggle("skillIds", skill.id, checked)}
+                  >
+                    <Sparkles size={16} />
+                    <span>{skill.name}</span>
+                    <DropdownMenu.ItemIndicator className="item-indicator"><Check size={14} /></DropdownMenu.ItemIndicator>
+                  </DropdownMenu.CheckboxItem>
+                )) : (
+                  <DropdownMenu.Item className="composer-plus-item" disabled>
+                    <Sparkles size={16} />
+                    <span>{t("skillsEmpty")}</span>
+                  </DropdownMenu.Item>
+                )}
+              </DropdownMenu.SubContent>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Sub>
+          <DropdownMenu.Sub>
+            <DropdownMenu.SubTrigger className="composer-plus-item">
+              <Wrench size={18} />
+              <span>{t("builtInTools")}</span>
+              <ChevronRight size={15} className="composer-plus-chevron" />
+            </DropdownMenu.SubTrigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.SubContent className="menu composer-plus-submenu" sideOffset={6}>
+                {tools.length ? tools.map((tool) => (
+                  <DropdownMenu.CheckboxItem
+                    key={tool.name}
+                    className="composer-plus-item"
+                    checked={state.toolNames.includes(tool.name)}
+                    onCheckedChange={(checked) => toggle("toolNames", tool.name, checked)}
+                  >
+                    <Wrench size={16} />
+                    <span>{tool.name}</span>
+                    <DropdownMenu.ItemIndicator className="item-indicator"><Check size={14} /></DropdownMenu.ItemIndicator>
+                  </DropdownMenu.CheckboxItem>
+                )) : (
+                  <DropdownMenu.Item className="composer-plus-item" disabled>
+                    <Wrench size={16} />
+                    <span>{t("noCapabilities")}</span>
+                  </DropdownMenu.Item>
+                )}
+              </DropdownMenu.SubContent>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Sub>
+          <DropdownMenu.Sub>
+            <DropdownMenu.SubTrigger className="composer-plus-item">
+              <Target size={18} />
+              <span>{t("goals")}</span>
+              <ChevronRight size={15} className="composer-plus-chevron" />
+            </DropdownMenu.SubTrigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.SubContent className="menu composer-plus-submenu">
+                <DropdownMenu.Item className="composer-plus-item" disabled>
+                  <Target size={16} />
+                  <span>{t("goalsEmpty")}</span>
+                </DropdownMenu.Item>
+              </DropdownMenu.SubContent>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Sub>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function SkillPickerMenu({
+  skills,
+  selectedSkillIds,
+  query,
+  open,
+  onOpenChange,
+  onQueryChange,
+  onSelect,
+  disabled,
+  t,
+  showTrigger = true,
+}: {
+  skills: Skill[];
+  selectedSkillIds: string[];
+  query: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onQueryChange: (query: string) => void;
+  onSelect: (skill: Skill) => void;
+  disabled: boolean;
+  t: (key: string) => string;
+  showTrigger?: boolean;
+}) {
+  const availableSkills = skills.filter((skill) => skill.enabled);
+  const filteredSkills = availableSkills.filter((skill) =>
+    `${skill.name} ${skill.description}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+  );
+  return (
+    <DropdownMenu.Root open={open} onOpenChange={onOpenChange} modal={false}>
+      {showTrigger ? <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          className={`skill-picker-trigger ${selectedSkillIds.length ? "has-selection" : ""}`}
+          aria-label={t("skills")}
+          title={t("skills")}
+          disabled={disabled}
+        >
+          <Sparkles size={17} />
+          {selectedSkillIds.length ? <span className="skill-picker-count">{selectedSkillIds.length}</span> : null}
+        </button>
+      </DropdownMenu.Trigger> : null}
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="menu skill-picker-menu" align="start" side="top" sideOffset={10}>
+          <div className="skill-picker-heading">
+            <div>
+              <DropdownMenu.Label className="menu-label">{t("skills")}</DropdownMenu.Label>
+              <p>{t("skillPickerHint")}</p>
+            </div>
+            {selectedSkillIds.length ? <span className="skill-picker-selected-count">{selectedSkillIds.length}</span> : null}
+          </div>
+          <label className="skill-picker-search">
+            <Search size={14} />
+            <span className="visually-hidden">{t("searchSkills")}</span>
+            <input
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              onKeyDown={(event) => event.stopPropagation()}
+              placeholder={t("searchSkills")}
+            />
+          </label>
+          <div className="skill-picker-list" role="group" aria-label={t("skills")}>
+            {filteredSkills.length ? filteredSkills.map((skill) => {
+              const selected = selectedSkillIds.includes(skill.id);
+              return (
+                <DropdownMenu.Item
+                  className="skill-picker-item"
+                  key={skill.id}
+                  onSelect={() => onSelect(skill)}
+                >
+                  <span className={`skill-picker-check ${selected ? "is-selected" : ""}`} aria-hidden="true">
+                    {selected ? <Check size={13} /> : null}
+                  </span>
+                  <span className="skill-picker-item-copy">
+                    <strong>{skill.name}</strong>
+                    <small>{skill.description || t("skillNoDescription")}</small>
+                  </span>
+                </DropdownMenu.Item>
+              );
+            }) : (
+              <div className="skill-picker-empty">
+                <Sparkles size={16} />
+                <span>{availableSkills.length ? t("noMatchingSkills") : t("skillsEmpty")}</span>
+              </div>
+            )}
+          </div>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function ComposerModelMenu({
+  models,
+  activeModelProfileId,
+  onModelChange,
+  disabled,
+  t,
+}: {
+  models: ModelProfile[];
+  activeModelProfileId?: string | null;
+  onModelChange: (modelId: string) => void;
+  disabled: boolean;
+  t: (key: string) => string;
+}) {
+  const activeModel = models.find((model) => model.id === activeModelProfileId);
+  return (
+    <DropdownMenu.Root modal={false}>
+      <DropdownMenu.Trigger asChild>
+        <button type="button" className="composer-model-trigger" disabled={disabled} aria-label={t("models")}>
+          <Cpu size={15} />
+          <span>{activeModel?.modelName ?? t("modelEmpty")}</span>
+          <ChevronDown size={14} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content className="menu composer-model-menu" align="end" side="top" sideOffset={10}>
+          <DropdownMenu.Label className="menu-label">{t("models")}</DropdownMenu.Label>
+          {models.length ? models.map((model) => (
+            <DropdownMenu.Item className="menu-item" key={model.id} onSelect={() => onModelChange(model.id)}>
+              <Cpu size={15} />
+              <span className="menu-item-copy"><strong>{model.modelName}</strong><small>{model.providerType}</small></span>
+              {model.id === activeModelProfileId ? <Check size={15} className="menu-item-check" /> : null}
+            </DropdownMenu.Item>
+          )) : (
+            <DropdownMenu.Item className="menu-item" disabled><CircleAlert size={15} />{t("modelEmpty")}</DropdownMenu.Item>
+          )}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }
 
@@ -4314,6 +4857,8 @@ function ConfigurationWorkspace({
   });
   const tabs = [
     { id: "agents", icon: Bot, label: t("agents") },
+    { id: "memory", icon: MemoryStick, label: t("memoryManagement") },
+    { id: "personas", icon: UserRound, label: t("personaManagement"), hintKey: "personaHint" },
     { id: "skills", icon: Sparkles, label: t("skills") },
     { id: "mcp", icon: Globe2, label: t("mcp") },
     { id: "knowledge", icon: Database, label: t("knowledge") },
@@ -4392,9 +4937,6 @@ function ConfigurationWorkspace({
               </h1>
               <p>{t("manageHint")}</p>
             </div>
-            <IconButton label={t("close")} onClick={requestClose}>
-              <X size={18} />
-            </IconButton>
           </header>
           <Tabs.Root
             value={tab}
@@ -4583,6 +5125,25 @@ function ManagerPanelBody({
     return (
       <Suspense fallback={<div className="manager-placeholder"><LoaderCircle size={18} className="spin" /></div>}>
         <AgentManager agents={agents} models={models} skills={skills ?? []} tools={tools} query={queries.agents} t={t} onDirtyChange={onAgentDirtyChange} />
+      </Suspense>
+    );
+  if (id === "memory")
+    return (
+      <Suspense
+        fallback={
+          <div className="manager-placeholder">
+            <LoaderCircle size={18} className="spin" />
+            <span>{t("loading")}</span>
+          </div>
+        }
+      >
+        <MemoryManager t={t} />
+      </Suspense>
+    );
+  if (id === "personas")
+    return (
+      <Suspense fallback={<div className="manager-placeholder"><LoaderCircle size={18} className="spin" /><span>{t("loading")}</span></div>}>
+        <PersonaManager t={t} />
       </Suspense>
     );
   if (id === "skills")
@@ -4803,6 +5364,8 @@ function formatDuration(milliseconds: number) {
 }
 
 function idToQueryKey(id: string) {
+  if (id === "memory") return ["memories"];
+  if (id === "personas") return ["personas"];
   if (id === "skills") return ["skills"];
   if (id === "mcp") return ["mcp-connections"];
   if (id === "knowledge") return ["knowledge-bases"];

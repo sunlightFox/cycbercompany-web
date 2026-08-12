@@ -1,6 +1,7 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
 import { createUuid } from './uuid'
-import type { Agent, AgentDraftTestResult, AgentEvaluationReport, AgentManifestV2, AgentManifestValidation, AgentV2, AgentVersionV2, AgentVisibility, ApprovalMode, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeChunk, KnowledgeDocument, KnowledgeSearchResult, KnowledgeSettings, KnowledgeSettingsUpdate, KnowledgeStats, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, RunWorkflow, Skill, SkillDetail, SkillHubSkill, SkillPreflight, SkillRepository, SystemStatus, Tool, ToolApproval } from '../types'
+import type { MemoryOrigin } from '../types'
+import type { Agent, AgentDraftTestResult, AgentEvaluationReport, AgentManifestV2, AgentManifestValidation, AgentV2, AgentVersionV2, AgentVisibility, ApprovalMode, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeChunk, KnowledgeDocument, KnowledgeSearchResult, KnowledgeSettings, KnowledgeSettingsUpdate, KnowledgeStats, McpConnection, McpRepository, McpTool, McpToolInvocation, MemoryItem, MemoryStatus, MemoryType, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, RunWorkflow, Skill, SkillDetail, SkillHubSkill, SkillPreflight, SkillRepository, SystemStatus, Tool, ToolApproval, UserPersona } from '../types'
 
 const API_ROOT = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
 const API_V2_ROOT = import.meta.env.VITE_API_V2_BASE_URL ?? API_ROOT.replace(/\/v1\/?$/, '/v2')
@@ -50,6 +51,7 @@ export class RunStreamTimeoutError extends Error {
 export type LocalExecutorLauncherHealth = {
   reachable: boolean
   online: boolean
+  starting: boolean
   workspace?: string
 }
 
@@ -113,16 +115,21 @@ async function requestLocalExecutorLauncherHealth(): Promise<LocalExecutorLaunch
       headers: { Accept: 'application/json' },
     })
     if (!response.ok) {
-      return { reachable: false, online: false }
+      return { reachable: false, online: false, starting: false }
     }
-    const payload = await response.json().catch(() => ({} as { online?: boolean; workspace?: string }))
+    const payload = await response.json().catch(() => ({} as {
+      online?: boolean
+      starting?: boolean
+      workspace?: string
+    }))
     return {
       reachable: true,
       online: Boolean(payload.online),
+      starting: Boolean(payload.starting),
       workspace: typeof payload.workspace === 'string' ? payload.workspace : undefined,
     }
   } catch {
-    return { reachable: false, online: false }
+    return { reachable: false, online: false, starting: false }
   }
 }
 
@@ -188,6 +195,29 @@ export const studioApi = {
   evaluateAgentV2Draft: (id: string, versionId: string) => requestV2<AgentEvaluationReport>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/evaluations`, { method: 'POST' }),
   publishAgentV2Draft: (id: string, versionId: string) => requestV2<AgentVersionV2>(`/agents/${encodeURIComponent(id)}/drafts/${encodeURIComponent(versionId)}/publish`, { method: 'POST' }),
   archiveAgentV2: (id: string) => requestV2<AgentV2>(`/agents/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
+  listMemories: (filters: { agentId?: string; personaId?: string; sharedOnly?: boolean; type?: MemoryType; status?: MemoryStatus; origin?: MemoryOrigin; query?: string; limit?: number } = {}) => {
+    const params = new URLSearchParams()
+    if (filters.agentId) params.set('agentId', filters.agentId)
+    if (filters.personaId) params.set('personaId', filters.personaId)
+    if (filters.sharedOnly) params.set('sharedOnly', 'true')
+    if (filters.type) params.set('type', filters.type)
+    if (filters.status) params.set('status', filters.status)
+    if (filters.origin) params.set('origin', filters.origin)
+    if (filters.query?.trim()) params.set('query', filters.query.trim())
+    params.set('limit', String(filters.limit ?? 100))
+    return requestV2<MemoryItem[]>(`/memories?${params}`)
+  },
+  createMemory: (payload: { agentId: string; type: MemoryType; content: string; importance?: number; expiresAt?: string | null; personaId?: string | null; scope?: 'AGENT' | 'USER' }) => requestV2<MemoryItem>('/memories', { method: 'POST', body: JSON.stringify(payload) }),
+  updateMemory: (id: string, payload: { type: MemoryType; content: string; importance: number; expiresAt: string | null; expectedRevision: number; scope?: 'AGENT' | 'USER'; personaId?: string | null }) => requestV2<MemoryItem>(`/memories/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  confirmMemory: (id: string) => requestV2<MemoryItem>(`/memories/${encodeURIComponent(id)}/confirm`, { method: 'POST' }),
+  rejectMemory: (id: string) => requestV2<MemoryItem>(`/memories/${encodeURIComponent(id)}/reject`, { method: 'POST' }),
+  listPersonas: () => requestV2<UserPersona[]>('/personas'),
+  createPersona: (payload: { name: string; description?: string; attributes?: Record<string, string>; defaultPersona?: boolean }) => requestV2<UserPersona>('/personas', { method: 'POST', body: JSON.stringify(payload) }),
+  updatePersona: (id: string, payload: { name: string; description?: string; attributes?: Record<string, string>; expectedRevision: number }) => requestV2<UserPersona>(`/personas/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  setDefaultPersona: (id: string) => requestV2<UserPersona>(`/personas/${encodeURIComponent(id)}/default`, { method: 'POST' }),
+  deletePersona: (id: string) => requestV2<void>(`/personas/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  deleteMemory: (id: string) => requestV2<void>(`/memories/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  clearMemories: (agentId?: string, personaId?: string, sharedOnly = false) => requestV2<{ deleted: number }>('/memories/clear', { method: 'POST', body: JSON.stringify({ agentId: agentId || null, personaId: personaId || null, sharedOnly }) }),
   listModels: () => requestCore<ModelProfile[]>('/models'),
   listModelPresets: () => request<ModelPreset[]>('/models/presets'),
   getModelSettings: () => request<ModelSettings>('/models/settings'),
@@ -270,6 +300,9 @@ export const studioApi = {
         `Local executor launcher is not reachable at ${LOCAL_EXECUTOR_LAUNCHER_URL}. Start the local launcher on this machine, then try again.`,
       )
     }
+    if (health.online || health.starting) {
+      return { started: false, starting: health.starting, online: health.online }
+    }
     let response: Response
     try {
       response = await fetch(`${LOCAL_EXECUTOR_LAUNCHER_URL}/start`, {
@@ -301,10 +334,15 @@ export const studioApi = {
   setDefaultModel: (modelProfileId: string) => request<{ defaultModelProfileId: string }>('/models/settings/default', { method: 'PATCH', body: JSON.stringify({ modelProfileId }) }),
   getConversation: (id: string) => request<Conversation>(`/conversations/${encodeURIComponent(id)}`),
   archiveConversation: (id: string) => request<Conversation>(`/conversations/${encodeURIComponent(id)}/archive`, { method: 'POST' }),
-  createConversation: (title: string) => request<{ id: string }>('/conversations', {
+  createConversation: (title: string, personaId?: string | null) => request<Conversation>('/conversations', {
     method: 'POST',
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({ title, personaId: personaId ?? null }),
   }),
+  selectConversationPersona: (conversationId: string, personaId: string | null) =>
+    request<Conversation>(`/conversations/${encodeURIComponent(conversationId)}/persona`, {
+      method: 'PATCH',
+      body: JSON.stringify({ personaId }),
+    }),
   uploadConversationAttachments: (conversationId: string, files: File[]) => {
     const body = new FormData()
     files.forEach((file) => body.append('files', file))

@@ -179,6 +179,47 @@ export type AgentEvaluationReport = {
   }>
 }
 
+export type MemoryType = 'PROFILE' | 'SEMANTIC' | 'EPISODIC' | 'PROCEDURAL'
+export type MemoryScope = 'AGENT' | 'USER'
+export type MemoryOrigin = 'USER_CREATED' | 'AUTO_EXTRACTED' | 'AUTO_MERGED'
+export type MemoryStatus = 'CANDIDATE' | 'CONFIRMED' | 'REJECTED'
+export type MemorySensitivity = 'NORMAL' | 'SENSITIVE' | 'PROHIBITED'
+
+export type MemoryItem = {
+  id: string
+  agentId: string
+  scope: MemoryScope
+  origin: MemoryOrigin
+  memoryKey: string | null
+  supersededBy: string | null
+  personaId: string | null
+  type: MemoryType
+  status: MemoryStatus
+  sensitivity: MemorySensitivity
+  content: string
+  confidence: number
+  importance: number
+  sourceConversationId: string | null
+  sourceRunId: string | null
+  evidenceSummary: string | null
+  createdAt: string
+  updatedAt: string
+  lastUsedAt: string | null
+  expiresAt: string | null
+  revision: number
+}
+
+export type UserPersona = {
+  id: string
+  name: string
+  description: string
+  attributes: Record<string, unknown>
+  defaultPersona: boolean
+  revision: number
+  createdAt: string
+  updatedAt: string
+}
+
 export type ModelProfile = {
   id: string
   providerType: string
@@ -586,6 +627,7 @@ export type Conversation = {
   createdAt?: string
   archived: boolean
   archivedAt?: string | null
+  personaId?: string | null
   messages: Message[]
 }
 
@@ -663,7 +705,7 @@ export type DeliveryGate = {
 
 export type RunAuditTimelineEntry = {
   id: string
-  kind: 'event' | 'tool' | 'node-tool' | 'mcp' | 'approval' | 'artifact' | string
+  kind: 'event' | 'run' | 'model' | 'tool' | 'node-tool' | 'mcp' | 'approval' | 'artifact' | string
   title: string
   detail?: string | null
   status: string
@@ -675,26 +717,42 @@ export type RunAudit = {
   run: RunView
   snapshot?: {
     agentId: string
-    agentPromptVersion: number
+    agentVersionId?: string | null
     modelProfileId: string
-    modelName: string
     allowedTools: string[]
     knowledgeBaseIds: string[]
     mcpConnectionIds: string[]
     nodeId?: string | null
     workingDirectory: string
     skillIds: string[]
+    personaId?: string | null
+    personaName?: string | null
+    recalledMemoryCount: number
+    recalledMemoryTypes: string[]
     createdAt: string
   } | null
   summary: {
     events: number
+    modelCalls: number
     tools: number
-    nodeTools: number
-    mcpTools: number
     approvals: number
     artifacts: number
   }
+  usage: {
+    modelCalls: number
+    providerReportedCalls: number
+    promptTokens: number
+    completionTokens: number
+    totalTokens: number
+    modelLatencyMs: number
+  }
+  timing: {
+    queueMs: number
+    executionMs: number
+    totalMs: number
+  }
   timeline: RunAuditTimelineEntry[]
+  citations: Citation[]
   artifacts: Artifact[]
 }
 

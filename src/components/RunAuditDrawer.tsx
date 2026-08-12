@@ -2,7 +2,10 @@ import * as Dialog from "@radix-ui/react-dialog";
 import {
   Check,
   CircleAlert,
+  Clock3,
+  Cpu,
   Download,
+  ExternalLink,
   History,
   LoaderCircle,
   Package,
@@ -12,6 +15,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
+import { safeExternalUrl } from "../lib/safeExternalUrl";
 import type {
   Artifact,
   CodingRunEvidence,
@@ -64,7 +68,7 @@ export default function RunAuditDrawer({
                 <h2>
                   {quality
                     ? `${quality.score}/100 ${quality.grade}`
-                    : t("deliveryEvidence")}
+                    : t("runDetails")}
                 </h2>
               </Dialog.Title>
             </div>
@@ -96,17 +100,24 @@ export default function RunAuditDrawer({
             {!loading && !error ? (
               <>
                 <div className="audit-summary">
-                  <span>{t("toolCalls")}</span>
-                  <strong>{evidence?.toolCalls ?? 0}</strong>
-                  <span>{t("browserVerification")}</span>
+                  <span><Clock3 size={14} /> {t("runTotalDuration")}</span>
+                  <strong>{formatDuration(audit?.timing.totalMs)}</strong>
+                  <span><Cpu size={14} /> {t("modelCalls")}</span>
+                  <strong>{audit?.usage.modelCalls ?? 0}</strong>
+                  <span>{t("tokenUsage")}</span>
                   <strong>
-                    {evidence?.browserVerified ? t("verified") : t("notVerified")}
+                    {audit?.usage.providerReportedCalls
+                      ? formatNumber(audit.usage.totalTokens)
+                      : t("usageUnavailable")}
                   </strong>
-                  <span>{t("artifacts")}</span>
-                  <strong>{artifacts?.length ?? 0}</strong>
-                  <span>{t("auditTimeline")}</span>
-                  <strong>{audit?.timeline.length ?? 0}</strong>
+                  <span>{t("toolCalls")}</span>
+                  <strong>{audit?.summary.tools ?? evidence?.toolCalls ?? 0}</strong>
                 </div>
+                {audit?.usage.providerReportedCalls ? (
+                  <p className="audit-usage-detail">
+                    {t("inputTokens")}: {formatNumber(audit.usage.promptTokens)} · {t("outputTokens")}: {formatNumber(audit.usage.completionTokens)} · {t("modelLatency")}: {formatDuration(audit.usage.modelLatencyMs)}
+                  </p>
+                ) : null}
                 {workflow ? (
                   <section className="audit-section">
                     <h3>{t("workflowStatus")}</h3>
@@ -139,12 +150,13 @@ export default function RunAuditDrawer({
                       <div>
                         <dt>{t("auditAgent")}</dt>
                         <dd>
-                          {audit.snapshot.agentId} v{audit.snapshot.agentPromptVersion}
+                          {audit.snapshot.agentId}
+                          {audit.snapshot.agentVersionId ? ` · ${audit.snapshot.agentVersionId}` : ""}
                         </dd>
                       </div>
                       <div>
                         <dt>{t("auditModel")}</dt>
-                        <dd>{audit.snapshot.modelName}</dd>
+                        <dd>{audit.snapshot.modelProfileId}</dd>
                       </div>
                       <div>
                         <dt>{t("auditNode")}</dt>
@@ -154,7 +166,26 @@ export default function RunAuditDrawer({
                         <dt>{t("auditScope")}</dt>
                         <dd>{audit.snapshot.workingDirectory || "."}</dd>
                       </div>
+                      <div>
+                        <dt>{t("auditPersona")}</dt>
+                        <dd>{audit.snapshot.personaName ?? audit.snapshot.personaId ?? t("auditNoPersona")}</dd>
+                      </div>
+                      <div>
+                        <dt>{t("auditRecalledMemory")}</dt>
+                        <dd>{formatRecalledMemory(audit.snapshot.recalledMemoryCount, audit.snapshot.recalledMemoryTypes, t)}</dd>
+                      </div>
                     </dl>
+                  </section>
+                ) : null}
+                {audit?.snapshot ? (
+                  <section className="audit-section">
+                    <h3>{t("auditCapabilities")}</h3>
+                    <div className="audit-capability-grid">
+                      <AuditCapabilityList label={t("auditTools")} values={audit.snapshot.allowedTools ?? []} empty={t("auditNone")} />
+                      <AuditCapabilityList label={t("auditSkills")} values={audit.snapshot.skillIds ?? []} empty={t("auditNone")} />
+                      <AuditCapabilityList label={t("auditMcpConnections")} values={audit.snapshot.mcpConnectionIds ?? []} empty={t("auditNone")} />
+                      <AuditCapabilityList label={t("auditKnowledgeBases")} values={audit.snapshot.knowledgeBaseIds ?? []} empty={t("auditNone")} />
+                    </div>
                   </section>
                 ) : null}
                 {audit?.timeline.length ? (
@@ -179,6 +210,32 @@ export default function RunAuditDrawer({
                         </li>
                       ))}
                     </ol>
+                  </section>
+                ) : null}
+                {audit?.citations.length ? (
+                  <section className="audit-section">
+                    <h3>{t("auditCitedSources")}</h3>
+                    <ul className="audit-citation-list">
+                      {audit.citations.map((citation) => {
+                        const externalLocation = citation.type === "web"
+                          ? safeExternalUrl(citation.location)
+                          : undefined;
+                        return (
+                          <li key={citation.id}>
+                            <div>
+                              <strong>{citation.title}</strong>
+                              <small>{citation.source}</small>
+                              {citation.quote ? <p>{citation.quote}</p> : null}
+                              {externalLocation ? (
+                                <a href={externalLocation} target="_blank" rel="noreferrer">
+                                  <ExternalLink size={13} />{externalLocation}
+                                </a>
+                              ) : citation.location ? <span>{citation.location}</span> : null}
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
                   </section>
                 ) : null}
                 {auditLists.map(([label, entries]) =>
@@ -286,13 +343,44 @@ function WorkflowPlan({ planJson, t }: { planJson: string; t: Translator }) {
   );
 }
 
+function AuditCapabilityList({ label, values, empty }: { label: string; values: string[]; empty: string }) {
+  return (
+    <div className="audit-capability-group">
+      <span>{label}</span>
+      {values.length ? <ul>{values.map((value) => <li key={value}>{value}</li>)}</ul> : <small>{empty}</small>}
+    </div>
+  );
+}
+
 function AuditTimelineIcon({ kind }: { kind: string }) {
+  if (kind === "model") return <Cpu size={14} />;
   if (kind === "tool") return <Wrench size={14} />;
   if (kind === "node-tool") return <TerminalSquare size={14} />;
   if (kind === "mcp") return <PlugZap size={14} />;
   if (kind === "approval") return <ShieldCheck size={14} />;
   if (kind === "artifact") return <Package size={14} />;
   return <History size={14} />;
+}
+
+function formatDuration(value?: number) {
+  if (value === undefined || value < 0) return "-";
+  if (value < 1_000) return `${value} ms`;
+  if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} s`;
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1_000);
+  return `${minutes} min ${seconds} s`;
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat().format(value);
+}
+
+function formatRecalledMemory(count: number, types: string[], t: Translator) {
+  if (!count) return t("auditNoRecalledMemory");
+  const translatedTypes = types.map((type) => t(`memoryType${type}`)).join(", ");
+  return t("auditMemorySummary")
+    .replace("{count}", String(count))
+    .replace("{types}", translatedTypes || t("unknown"));
 }
 
 function formatAuditTime(value: string) {

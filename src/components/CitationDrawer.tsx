@@ -1,5 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { FileText, X } from "lucide-react";
+import { safeExternalUrl } from "../lib/safeExternalUrl";
 import type { Citation } from "../types";
 
 type Translator = (key: string) => string;
@@ -13,6 +14,8 @@ export default function CitationDrawer({
   onClose: () => void;
   t: Translator;
 }) {
+  const externalLocation = citation.type === "web" ? safeExternalUrl(citation.location) : undefined;
+
   return (
     <Dialog.Root open onOpenChange={(open) => !open && onClose()}>
       <Dialog.Portal>
@@ -50,14 +53,14 @@ export default function CitationDrawer({
                 {t("location")}: {citation.location}
               </p>
             ) : null}
-            {citation.type === "web" ? (
+            {externalLocation ? (
               <a
                 className="source-link"
-                href={citation.location}
+                href={externalLocation}
                 target="_blank"
                 rel="noreferrer"
               >
-                {citation.location}
+                {externalLocation}
               </a>
             ) : null}
           </div>
