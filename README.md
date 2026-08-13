@@ -1,6 +1,6 @@
-# Spring Agent Studio Web
+# CycberCompany Web
 
-The conversation-first frontend for Spring Agent Studio. It connects to the local Spring Boot backend, keeps execution steps inline with assistant messages, and progressively reveals citations and configuration.
+The conversation-first frontend for CycberCompany. It connects to the local Spring Boot backend, keeps execution steps inline with assistant messages, and progressively reveals citations and configuration.
 
 ## Run
 

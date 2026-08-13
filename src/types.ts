@@ -779,7 +779,7 @@ export type ConversationQueue = {
 
 export type RunEvent = {
   sequence: number
-  type: 'RUN_QUEUED' | 'SKILLS_RESOLVED' | 'RUN_STARTED' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'RETRIEVAL_SOURCES' | 'MODEL_RATE_LIMITED' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_APPROVAL_REQUIRED' | 'TOOL_CALL_COMPLETED' | 'TOOL_BUDGET_WARNING' | 'RUN_WAITING_APPROVAL' | 'RUN_RESUMED' | 'TOOL_CALL_FAILED' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'RUN_NEEDS_VERIFICATION' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED' | 'RUN_INTERRUPTED'
+  type: 'RUN_QUEUED' | 'SKILLS_RESOLVED' | 'RUN_STARTED' | 'PROGRESS_UPDATE' | 'STEP_STARTED' | 'RETRIEVAL_COMPLETED' | 'RETRIEVAL_SOURCES' | 'MODEL_RATE_LIMITED' | 'MODEL_PROVIDER_RETRYING' | 'MODEL_USAGE' | 'TOOL_CALL_REQUESTED' | 'TOOL_CALL_STARTED' | 'TOOL_CALL_PROGRESS' | 'TOOL_APPROVAL_REQUIRED' | 'TOOL_CALL_COMPLETED' | 'TOOL_BUDGET_WARNING' | 'RUN_WAITING_APPROVAL' | 'RUN_RESUMED' | 'TOOL_CALL_FAILED' | 'RESOURCE_CLEANUP_STARTED' | 'RESOURCE_CLEANUP_WARNING' | 'TOKEN_DELTA' | 'STEP_COMPLETED' | 'RUN_NEEDS_VERIFICATION' | 'FINAL_ANSWER' | 'RUN_FAILED' | 'RUN_CANCELLED' | 'RUN_INTERRUPTED'
   payload: string
   createdAt?: string
 }
@@ -795,7 +795,7 @@ export type StepStatus = 'running' | 'waiting' | 'warning' | 'complete' | 'faile
 
 export type RunStep = {
   id: string
-  kind?: 'capabilities' | 'queue' | 'coordinator' | 'execution' | 'retrieval' | 'tool-request' | 'tool' | 'approval' | 'warning' | 'answer' | 'verification' | 'resume' | string
+  kind?: 'capabilities' | 'queue' | 'coordinator' | 'execution' | 'progress' | 'retrieval' | 'tool-request' | 'tool' | 'approval' | 'warning' | 'answer' | 'verification' | 'resume' | string
   label: string
   detail?: string
   status: StepStatus

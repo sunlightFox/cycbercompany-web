@@ -1208,6 +1208,12 @@ function App() {
             status: "complete",
             duration: t("stepReady"),
           });
+          steps.push({
+            id: `${runId}-work-intro`,
+            kind: "progress",
+            label: t("workIntro"),
+            status: "running",
+          });
         }
         if (event.type === "STEP_STARTED")
           steps.push({
@@ -1216,6 +1222,21 @@ function App() {
             detail: event.payload,
             status: "running",
           });
+        if (event.type === "PROGRESS_UPDATE") {
+          const activeProgress = [...steps]
+            .reverse()
+            .find((step) => step.kind === "progress" && step.status === "running");
+          if (activeProgress) {
+            activeProgress.status = "complete";
+            activeProgress.duration = t("stepDone");
+          }
+          steps.push({
+            id: `${runId}-progress-${event.sequence}`,
+            kind: "progress",
+            label: safeProgressNarrative(event.payload, t),
+            status: "running",
+          });
+        }
         if (event.type === "RETRIEVAL_COMPLETED") {
           const next = completePrevious();
           next.push({
@@ -1253,6 +1274,27 @@ function App() {
               detail: event.payload,
               status: "running",
             });
+          completeActiveWorkNarrative(steps, t);
+          steps.push({
+            id: `${runId}-work-tool-${event.sequence}`,
+            kind: "progress",
+            label: safeToolNarrative(event.payload, t),
+            status: "running",
+          });
+        }
+        if (event.type === "TOOL_CALL_PROGRESS") {
+          const active = [...steps]
+            .reverse()
+            .find(
+              (step) =>
+                step.status === "running" &&
+                (step.kind === "tool-request" || step.kind === "tool"),
+            );
+          const elapsed = extractToolElapsedSeconds(event.payload);
+          if (active) {
+            active.detail = event.payload;
+            active.duration = elapsed === undefined ? undefined : `${elapsed} ${t("seconds")}`;
+          }
         }
         if (
           event.type === "TOOL_CALL_COMPLETED" ||
@@ -1281,7 +1323,16 @@ function App() {
                 event.type === "TOOL_CALL_FAILED"
                   ? t("stepFailed")
                   : t("stepDone"),
+              });
+          if (event.type === "TOOL_CALL_FAILED") {
+            completeActiveWorkNarrative(steps, t);
+            steps.push({
+              id: `${runId}-work-tool-failed-${event.sequence}`,
+              kind: "progress",
+              label: t("workToolFailed"),
+              status: "running",
             });
+          }
         }
         if (event.type === "MODEL_RATE_LIMITED")
           steps.push({
@@ -2366,7 +2417,7 @@ function App() {
               >
                 <Menu size={18} />
               </IconButton>
-              <h1 className="studio-wordmark">Spring Agent Studio</h1>
+              <h1 className="studio-wordmark">CycberCompany</h1>
             </div>
             <div className="topbar-actions">
               <div className="workspace-switchers" aria-label={t("workspace")}>
@@ -3318,6 +3369,12 @@ function MessageBlock({
   t: (key: string) => string;
 }) {
   const [actionsOpen, setActionsOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (message.role !== "ASSISTANT" || message.lifecycle === "terminal") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [message.lifecycle, message.role]);
   if (message.role === "USER")
     return (
       <article id={`message-${message.id}`} className="message-row user-row">
@@ -3359,6 +3416,13 @@ function MessageBlock({
     !waitingApproval &&
     !needsVerification &&
     (steps.some((step) => step.status === "running") || message.isStreaming);
+  const activeWorkNarrative = [...steps]
+    .reverse()
+    .find((step) => step.kind === "progress" && step.status === "running");
+  const visibleSteps = steps.filter((step) => step.kind !== "progress");
+  const executionDurationMs =
+    message.durationMs ??
+    (hasRunning || queued || waitingApproval ? elapsedSinceAt(message.createdAt, now) : undefined);
   const isCollapsed =
     !expanded &&
     !hasRunning &&
@@ -3375,10 +3439,10 @@ function MessageBlock({
     ? t("waitingApproval")
     : unknown
       ? t("runStatusUnknown")
-    : needsVerification
-      ? t("needsVerification")
+      : needsVerification
+        ? t("needsVerification")
       : hasRunning
-        ? t("running")
+        ? t("workingFor").replace("{{duration}}", formatWorkingDuration(executionDurationMs ?? 0, t))
         : cancelled
           ? t("runCancelled")
           : failed
@@ -3434,11 +3498,11 @@ function MessageBlock({
             </span>
             <span className="execution-summary-copy">
               <strong>{executionLabel}</strong>
-              <span>{steps.length} {t("stepCount")}</span>
+              <span>{visibleSteps.length} {t("stepCount")}</span>
             </span>
-            {message.durationMs ? (
+            {executionDurationMs !== undefined ? (
               <span className="execution-meta">
-                · {formatDuration(message.durationMs)} {t("seconds")}
+                · {formatWorkingDuration(executionDurationMs, t)}
               </span>
             ) : null}
             <ChevronRight
@@ -3446,9 +3510,15 @@ function MessageBlock({
               className={`execution-chevron ${!isCollapsed ? "is-open" : ""}`}
             />
           </button>
+          {hasRunning && activeWorkNarrative ? (
+            <div className="work-narrative" aria-live="polite">
+              <span>{t("workNarrative")}</span>
+              <p>{activeWorkNarrative.label}</p>
+            </div>
+          ) : null}
           {!isCollapsed ? (
             <div className="step-list" id={`${message.id}-execution-steps`}>
-              {steps.map((step) => (
+              {visibleSteps.map((step) => (
                 <StepRow key={step.id} step={step} t={t} />
               ))}
             </div>
@@ -5347,8 +5417,47 @@ function elapsedSince(value?: string) {
   return Math.max(0, Date.now() - start);
 }
 
+function completeActiveWorkNarrative(steps: RunStep[], t: (key: string) => string) {
+  const active = [...steps]
+    .reverse()
+    .find((step) => step.kind === "progress" && step.status === "running");
+  if (active) {
+    active.status = "complete";
+    active.duration = t("stepDone");
+  }
+}
+
+function safeProgressNarrative(payload: string, t: (key: string) => string) {
+  const text = payload.trim();
+  if (/正在分析|分析请求/.test(text)) return t("workAnalyze");
+  if (/正在检查|准备回答/.test(text)) return t("workContext");
+  if (/正在检索|检索完成/.test(text)) return t("workRetrieve");
+  if (/按步骤调用|验证结果/.test(text)) return t("workExecute");
+  if (/整理最终回答/.test(text)) return t("workFinalize");
+  return text || t("workContext");
+}
+
+function safeToolNarrative(payload: string, t: (key: string) => string) {
+  const tool = /tool=([^,\s]+)/i.exec(payload)?.[1] ?? "";
+  if (/project\.discover|fs\.list|fs\.glob/i.test(tool)) return t("workDiscover");
+  if (/fs\.read|file\.read/i.test(tool)) return t("workRead");
+  if (/fs\.(write|apply_patch)|file\.(write|patch)/i.test(tool)) return t("workWrite");
+  if (/git\.review|shell\.run|browser\./i.test(tool)) return t("workVerify");
+  return t("workTool");
+}
+
+function elapsedSinceAt(value: string | undefined, now: number) {
+  const start = value ? Date.parse(value) : now;
+  return Math.max(0, now - start);
+}
+
 function extractQueuePosition(payload: string) {
   const match = /(?:^|[,\s])position=(\d+)/i.exec(payload);
+  return match ? Number(match[1]) : undefined;
+}
+
+function extractToolElapsedSeconds(payload: string) {
+  const match = /(?:^|[,\s])elapsedSeconds=(\d+)/i.exec(payload);
   return match ? Number(match[1]) : undefined;
 }
 
@@ -5356,9 +5465,12 @@ function queuePositionLabel(t: (key: string) => string, position: number) {
   return t("queuePosition").replace("{{position}}", String(position));
 }
 
-function formatDuration(milliseconds: number) {
-  const seconds = milliseconds / 1000;
-  return seconds < 10 ? seconds.toFixed(1) : Math.round(seconds).toString();
+function formatWorkingDuration(milliseconds: number, t: (key: string) => string) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (!minutes) return `${seconds} ${t("seconds")}`;
+  return `${minutes} ${t("minutes")} ${seconds} ${t("seconds")}`;
 }
 
 function idToQueryKey(id: string) {

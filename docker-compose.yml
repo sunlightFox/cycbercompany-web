@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: spring-agent-studio-web
+    container_name: cycbercompany-web
     ports:
       - "5173:5173"
       - "5174:5173"
@@ -41,7 +41,7 @@ services:
     build:
       context: ../spring-agent-studio-backend
       dockerfile: Dockerfile.dev
-    container_name: spring-agent-studio-backend
+    container_name: cycbercompany-backend
     environment:
       # Docker port forwarding enters the shared namespace via its container
       # interface. The published 8083 port is host-loopback-only; the explicit
