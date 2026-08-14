@@ -5,9 +5,14 @@ export type Agent = {
   name: string
   description: string
   systemPrompt: string
-  defaultModelProfileId: string
-  toolAllowList: string
+  defaultModelProfileId: string | null
+  toolAllowList: string[]
+  defaultSkillIds: string[]
   enabled: boolean
+  promptVersion?: number
+  createdAt?: string
+  requestedAt?: string
+  updatedAt?: string
 }
 
 export type ModelProfile = {
@@ -48,6 +53,8 @@ export type ExecutionSettings = {
   updatedAt?: string | null
 }
 
+export type ApprovalMode = 'on-request' | 'auto-approve' | 'full-access'
+
 export type ModelTestResult = {
   modelProfileId: string
   success: boolean
@@ -77,6 +84,42 @@ export type Skill = {
   path?: string
   fileCount?: number
   sizeBytes?: number
+}
+
+export type SkillDetail = {
+  summary: Skill
+  skillMarkdown: string
+  files: string[]
+}
+
+export type SkillRuntimeRequirement = {
+  name: string
+  versionConstraint?: string | null
+  source: string
+}
+
+export type SkillCompatibilityIssue = {
+  severity: string
+  code: string
+  skillId: string
+  message: string
+}
+
+export type SkillCompatibility = {
+  compatible: boolean
+  issues: SkillCompatibilityIssue[]
+  requiredTools: string[]
+  runtimes: SkillRuntimeRequirement[]
+  requiredFeatures: string[]
+}
+
+export type SkillPreflight = {
+  ready: boolean
+  agentId: string
+  nodeId?: string | null
+  skillIds: string[]
+  allowedTools: string[]
+  compatibility: SkillCompatibility
 }
 
 export type SkillRepository = {
@@ -124,6 +167,7 @@ export type McpConnection = {
   tools?: McpTool[]
   createdAt?: string
   updatedAt?: string
+  lastError?: string
 }
 
 export type McpTool = {
@@ -190,6 +234,7 @@ export type KnowledgeDocument = {
   indexError?: string | null
   indexedAt?: string | null
   indexDurationMs?: number | null
+  duplicate?: boolean
   createdAt?: string
   updatedAt?: string
 }
@@ -197,6 +242,48 @@ export type KnowledgeDocument = {
 export type KnowledgeBaseDetail = {
   summary: KnowledgeBase
   documents: KnowledgeDocument[]
+}
+
+export type KnowledgeStats = {
+  knowledgeBaseId: string
+  documentCount: number
+  chunkCount: number
+}
+
+export type KnowledgeSettings = {
+  embeddingEnabled: boolean
+  embeddingCredentialConfigured: boolean
+  embeddingModel: string
+  embeddingBaseUrl: string
+  embeddingCredentialEnv: string
+  vectorStore: string
+  chunkSize: number
+  chunkOverlap: number
+}
+
+export type KnowledgeSettingsUpdate = {
+  embeddingEnabled: boolean
+  embeddingModel: string
+  embeddingBaseUrl: string
+  embeddingCredentialEnv?: string
+  apiKey?: string
+  vectorStore: string
+  chunkSize: number
+  chunkOverlap: number
+}
+
+export type KnowledgeChunk = {
+  id: number
+  knowledgeBaseId: string
+  documentId: string
+  sourceName: string
+  chunkIndex: number
+  content: string
+  embeddingIndexed: boolean
+}
+
+export type KnowledgeSearchResult = KnowledgeChunk & {
+  score: number
 }
 
 export type IngestionResult = {
@@ -221,8 +308,8 @@ export type BatchIngestionResult = {
 export type RebuildIndexResult = {
   knowledgeBaseId: string
   documentId?: string | null
-  rebuiltDocuments: number
-  totalChunks: number
+  rebuiltDocumentCount: number
+  chunkCount: number
 }
 
 export type NodeConnection = {
@@ -285,11 +372,23 @@ export type NodeToolApproval = {
   requestedBy?: string
   decidedBy?: string
   createdAt?: string
+  requestedAt?: string
   decidedAt?: string
   executedAt?: string
   executionStatus?: string
   resultJson?: string
   errorMessage?: string
+}
+
+export type ToolApproval = {
+  id: string
+  runId?: string | null
+  toolCallId?: string | null
+  status: string
+  createdAt?: string
+  requestedAt?: string
+  decidedAt?: string | null
+  errorMessage?: string | null
 }
 
 export type Message = {
@@ -359,13 +458,24 @@ export type RunView = {
   agentId: string
   retryOfRunId?: string | null
   skillSnapshotDigest?: string | null
-  status: 'QUEUED' | 'CREATED' | 'RUNNING' | 'WAITING_APPROVAL' | 'SUCCEEDED' | 'NEEDS_VERIFICATION' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' | 'INTERRUPTED'
+  status: 'QUEUED' | 'CREATED' | 'RUNNING' | 'WAITING_APPROVAL' | 'SUCCEEDED' | 'NEEDS_VERIFICATION' | 'FAILED' | 'CANCELLED' | 'TIMED_OUT' | 'INTERRUPTED' | string
   finalAnswer?: string | null
   errorMessage?: string | null
   queuePosition?: number | null
   createdAt?: string
   startedAt?: string | null
   finishedAt?: string | null
+  clientRequestId?: string | null
+  deliveryGate?: DeliveryGate | null
+}
+
+export type DeliveryGate = {
+  status: 'VERIFIED' | 'NEEDS_VERIFICATION' | 'UNAVAILABLE' | string
+  reasons?: string[]
+  missingEvidence?: string[]
+  desktopInspection?: 'PASSED' | 'FAILED' | 'TIMEOUT' | 'UNAVAILABLE' | string
+  fileOperation?: 'PASSED' | 'FAILED' | 'NOT_REQUIRED' | 'UNAVAILABLE' | string
+  finalEvidence?: boolean
 }
 
 export type RunAuditTimelineEntry = {
@@ -405,6 +515,20 @@ export type RunAudit = {
   artifacts: Artifact[]
 }
 
+export type RunWorkflow = {
+  runId: string
+  workspaceScope: string
+  goal: string
+  planJson: string
+  phase: string
+  lastToolName?: string | null
+  completedToolCalls: number
+  failedToolCalls: number
+  lastError?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 export type ConversationQueue = {
   conversationId: string
   activeRunId?: string | null
@@ -430,6 +554,7 @@ export type StepStatus = 'running' | 'waiting' | 'warning' | 'complete' | 'faile
 
 export type RunStep = {
   id: string
+  kind?: 'capabilities' | 'queue' | 'coordinator' | 'execution' | 'retrieval' | 'tool-request' | 'tool' | 'approval' | 'warning' | 'answer' | 'verification' | 'resume' | string
   label: string
   detail?: string
   status: StepStatus
@@ -455,7 +580,12 @@ export type StudioMessage = Message & {
   attachmentSummaries?: Array<{ name: string; kind: 'file' | 'image' }>
   queuePosition?: number
   isStreaming?: boolean
-  runState?: 'queued' | 'running' | 'waitingApproval' | 'needsVerification' | 'completed' | 'failed' | 'cancelled'
+  runState?: 'queued' | 'running' | 'waitingApproval' | 'needsVerification' | 'completed' | 'failed' | 'cancelled' | 'timedOut' | 'interrupted' | 'unknown'
+  lifecycle?: 'queued' | 'running' | 'waitingApproval' | 'terminal'
+  outcome?: 'succeeded' | 'failed' | 'cancelled' | 'unknown'
+  delivery?: 'verified' | 'needsVerification' | 'unavailable'
+  sync?: 'live' | 'reconnecting' | 'recovered' | 'lost'
+  deliveryGate?: DeliveryGate | null
   error?: string
   durationMs?: number
 }

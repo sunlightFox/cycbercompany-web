@@ -1,7 +1,59 @@
 import { createParser, type EventSourceMessage } from 'eventsource-parser'
-import type { Agent, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeDocument, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, Skill, SkillRepository, Tool } from '../types'
+import { createUuid } from './uuid'
+import type { Agent, ApprovalMode, Artifact, BatchIngestionResult, ClawHubSkill, CodingRunEvidence, CodingRunQuality, Conversation, ConversationAttachment, ConversationQueue, CreateRunResponse, ExecutionMode, ExecutionSettings, IngestionResult, KnowledgeBase, KnowledgeBaseDetail, KnowledgeChunk, KnowledgeDocument, KnowledgeSearchResult, KnowledgeSettings, KnowledgeSettingsUpdate, KnowledgeStats, McpConnection, McpRepository, McpTool, McpToolInvocation, ModelPreset, ModelProfile, ModelSettings, ModelTestResult, NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RebuildIndexResult, RepositorySkill, RotateNodeSecretResult, RunAudit, RunEvent, RunView, RunWorkflow, Skill, SkillDetail, SkillPreflight, SkillRepository, Tool, ToolApproval } from '../types'
 
 const API_ROOT = import.meta.env.VITE_API_BASE_URL ?? '/api/v1'
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const UPLOAD_REQUEST_TIMEOUT_MS = 60_000
+
+export type StudioApiFieldError = {
+  field: string
+  message: string
+}
+
+export class StudioApiError extends Error {
+  readonly status: number
+  readonly code?: string
+  readonly errors: StudioApiFieldError[]
+
+  constructor(message: string, status: number, code?: string, errors: StudioApiFieldError[] = []) {
+    super(message)
+    this.name = 'StudioApiError'
+    this.status = status
+    this.code = code
+    this.errors = errors
+    Object.setPrototypeOf(this, StudioApiError.prototype)
+  }
+}
+
+export class RunLaunchTimeoutError extends Error {
+  readonly clientRequestId: string
+
+  constructor(clientRequestId: string) {
+    super('Run launch timed out; the server may still be processing the request.')
+    this.name = 'RunLaunchTimeoutError'
+    this.clientRequestId = clientRequestId
+  }
+}
+
+export class RunStreamTimeoutError extends Error {
+  constructor() {
+    super('Run stream made no progress before the heartbeat deadline.')
+    this.name = 'RunStreamTimeoutError'
+  }
+}
+
+type ProblemPayload = {
+  detail?: string
+  message?: string
+  status?: number
+  code?: string
+  errors?: StudioApiFieldError[]
+}
+
+type StudioRequestInit = RequestInit & {
+  timeoutMs?: number
+}
 
 function authenticationHeaders(): Record<string, string> {
   const configuredToken = import.meta.env.VITE_API_TOKEN
@@ -11,70 +63,104 @@ function authenticationHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: StudioRequestInit): Promise<T> {
+  const { timeoutMs, signal: externalSignal, ...requestInit } = init ?? {}
   const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
-  const response = await fetch(`${API_ROOT}${path}`, {
-    ...init,
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
-      'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
-      'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
-      ...authenticationHeaders(),
-      ...init?.headers,
-    },
-  })
-
-  if (!response.ok) {
-    const body = await response.text()
-    let detail = body
-    try {
-      const parsed = JSON.parse(body) as { detail?: string; message?: string }
-      detail = parsed.detail || parsed.message || body
-    } catch {
-      // Keep plain-text proxy and server errors readable.
+  const controller = new AbortController()
+  let timedOut = false
+  const abortFromCaller = () => controller.abort(externalSignal?.reason)
+  externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
+  const timeout = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs ?? (isFormData ? UPLOAD_REQUEST_TIMEOUT_MS : DEFAULT_REQUEST_TIMEOUT_MS))
+  try {
+    const response = await fetch(`${API_ROOT}${path}`, {
+      ...requestInit,
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/json',
+        ...(init?.body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
+        'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
+        'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
+        ...authenticationHeaders(),
+        ...init?.headers,
+      },
+    })
+    if (!response.ok) {
+      throw await apiErrorFromResponse(response, `Request failed with ${response.status}`)
     }
-    throw new Error(detail || `Request failed with ${response.status}`)
-  }
 
-  if (response.status === 204) return undefined as T
-  return response.json() as Promise<T>
+    if (response.status === 204) return undefined as T
+    return response.json() as Promise<T>
+  } catch (error) {
+    if (timedOut) {
+      throw new StudioApiError('The server did not respond before the request timeout.', 504, 'REQUEST_TIMEOUT')
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
+    externalSignal?.removeEventListener('abort', abortFromCaller)
+  }
 }
 
 async function requestBlob(path: string): Promise<Blob> {
-  const response = await fetch(`${API_ROOT}${path}`, {
-    headers: {
-      Accept: 'application/octet-stream',
-      'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
-      'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
-      ...authenticationHeaders(),
-    },
-  })
-  if (!response.ok) {
-    const body = await response.text()
-    let detail = body
-    try {
-      const parsed = JSON.parse(body) as { detail?: string; message?: string }
-      detail = parsed.detail || parsed.message || body
-    } catch {}
-    throw new Error(detail || `Request failed with ${response.status}`)
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), UPLOAD_REQUEST_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${API_ROOT}${path}`, {
+      signal: controller.signal,
+      headers: {
+        Accept: 'application/octet-stream',
+        'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
+        'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
+        ...authenticationHeaders(),
+      },
+    })
+    if (!response.ok) {
+      throw await apiErrorFromResponse(response, `Request failed with ${response.status}`)
+    }
+    return response.blob()
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new StudioApiError('The download did not respond before the request timeout.', 504, 'REQUEST_TIMEOUT')
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
   }
-  return response.blob()
+}
+
+async function apiErrorFromResponse(response: Response, fallback: string): Promise<StudioApiError> {
+  const body = await response.text()
+  let parsed: ProblemPayload | undefined
+  try {
+    parsed = JSON.parse(body) as ProblemPayload
+  } catch {
+    // Keep plain-text proxy and server errors readable.
+  }
+  const message = parsed?.detail || parsed?.message || body || fallback
+  return new StudioApiError(message, parsed?.status ?? response.status, parsed?.code, parsed?.errors ?? [])
 }
 
 export const studioApi = {
   getExecutionSettings: () => request<ExecutionSettings>('/execution-settings'),
   updateExecutionSettings: (mode: ExecutionMode) => request<ExecutionSettings>('/execution-settings', { method: 'PATCH', body: JSON.stringify({ mode }) }),
   listAgents: () => request<Agent[]>('/agents'),
+  createAgent: (payload: { id: string; name: string; description: string; systemPrompt: string; defaultModelProfileId?: string | null; toolAllowList?: string[]; defaultSkillIds?: string[]; enabled?: boolean }) => request<Agent>('/agents', { method: 'POST', body: JSON.stringify(payload) }),
+  updateAgent: (id: string, payload: { name?: string; description?: string; systemPrompt?: string; defaultModelProfileId?: string | null; toolAllowList?: string[]; defaultSkillIds?: string[]; enabled?: boolean }) => request<Agent>(`/agents/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   listModels: () => request<ModelProfile[]>('/models'),
   listModelPresets: () => request<ModelPreset[]>('/models/presets'),
   getModelSettings: () => request<ModelSettings>('/models/settings'),
-  saveModel: (payload: { id: string; providerType: string; baseUrl: string; modelName: string; credentialRef: string; apiKey?: string; capabilities: string[]; enabled: boolean }) => request<ModelProfile>('/models', { method: 'POST', body: JSON.stringify(payload) }),
+  saveModel: (payload: { id: string; providerType: string; baseUrl: string; modelName: string; credentialRef?: string; apiKey?: string; capabilities: string[]; enabled: boolean }) => request<ModelProfile>('/models', { method: 'POST', body: JSON.stringify(payload) }),
   getModel: (id: string) => request<ModelProfile>(`/models/${encodeURIComponent(id)}`),
   deleteModel: (id: string) => request<void>(`/models/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testModel: (id: string, prompt?: string) => request<ModelTestResult>(`/models/${encodeURIComponent(id)}/test`, { method: 'POST', body: JSON.stringify(prompt ? { prompt } : {}) }),
   listTools: () => request<Tool[]>('/tools'),
   listSkills: () => request<Skill[]>('/skills'),
+  getSkill: (id: string) => request<SkillDetail>(`/skills/${encodeURIComponent(id)}`),
+  createSkill: (payload: { id: string; skillMarkdown: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills', { method: 'POST', body: JSON.stringify(payload) }),
+  updateSkillContent: (id: string, payload: { skillMarkdown: string; enabled?: boolean }) => request<Skill>(`/skills/${encodeURIComponent(id)}/content`, { method: 'PUT', body: JSON.stringify(payload) }),
   listSkillRepositories: () => request<SkillRepository[]>('/skill-repositories'),
   searchSkillRepositories: (payload: { query?: string; limit?: number }) => request<SkillRepository[]>('/skill-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
   discoverRepositorySkills: (payload: { repoUrl: string; ref?: string; limit?: number }) => request<RepositorySkill[]>('/skill-repositories/discover', { method: 'POST', body: JSON.stringify(payload) }),
@@ -89,6 +175,7 @@ export const studioApi = {
   installClawHubSkill: (payload: { reference: string; id?: string; enabled?: boolean; overwrite?: boolean }) => request<Skill>('/skills/install/clawhub', { method: 'POST', body: JSON.stringify(payload) }),
   setSkillEnabled: (id: string, enabled: boolean) => request<Skill>(`/skills/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   deleteSkill: (id: string) => request<void>(`/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  preflightSkill: (payload: { agentId?: string; skillIds: string[]; toolNames?: string[]; knowledgeBaseIds?: string[]; mcpServerIds?: string[]; nodeId?: string }) => request<SkillPreflight>('/skills/preflight', { method: 'POST', body: JSON.stringify(payload) }),
   listMcpConnections: () => request<McpConnection[]>('/mcp-connections'),
   listMcpRepositories: () => request<McpRepository[]>('/mcp-repositories'),
   searchMcpRepositories: (payload: { query?: string; limit?: number; source?: 'registry' | 'github' }) => request<McpRepository[]>('/mcp-repositories/search', { method: 'POST', body: JSON.stringify(payload) }),
@@ -102,9 +189,14 @@ export const studioApi = {
   listMcpToolInvocations: () => request<McpToolInvocation[]>('/mcp-tool-invocations'),
   setMcpToolEnabled: (connectionId: string, toolName: string, enabled: boolean) => request<McpTool>(`/mcp-connections/${encodeURIComponent(connectionId)}/tools/${encodeURIComponent(toolName)}/${enabled ? 'enable' : 'disable'}`, { method: 'POST' }),
   listKnowledgeBases: () => request<KnowledgeBase[]>('/knowledge-bases'),
+  getKnowledgeSettings: () => request<KnowledgeSettings>('/knowledge-settings'),
+  updateKnowledgeSettings: (payload: KnowledgeSettingsUpdate) => request<KnowledgeSettings>('/knowledge-settings', { method: 'PATCH', body: JSON.stringify(payload) }),
   createKnowledgeBase: (payload: { name: string; description?: string }) => request<KnowledgeBase>('/knowledge-bases', { method: 'POST', body: JSON.stringify(payload) }),
   getKnowledgeBase: (id: string) => request<KnowledgeBaseDetail>(`/knowledge-bases/${encodeURIComponent(id)}`),
+  getKnowledgeStats: (id: string) => request<KnowledgeStats>(`/knowledge-bases/${encodeURIComponent(id)}/stats`),
   listKnowledgeDocuments: (id: string) => request<KnowledgeDocument[]>(`/knowledge-bases/${encodeURIComponent(id)}/documents`),
+  listKnowledgeChunks: (baseId: string, documentId: string) => request<KnowledgeChunk[]>(`/knowledge-bases/${encodeURIComponent(baseId)}/documents/${encodeURIComponent(documentId)}/chunks`),
+  searchKnowledge: (payload: { knowledgeBaseIds: string[]; query: string; limit?: number }) => request<KnowledgeSearchResult[]>('/knowledge-search', { method: 'POST', body: JSON.stringify(payload) }),
   ingestKnowledgeDocument: (id: string, payload: { sourceName: string; content: string }) => request<IngestionResult>(`/knowledge-bases/${encodeURIComponent(id)}/documents`, { method: 'POST', body: JSON.stringify(payload) }),
   uploadKnowledgeDocument: (id: string, file: File) => { const body = new FormData(); body.append('file', file); return request<IngestionResult>(`/knowledge-bases/${encodeURIComponent(id)}/documents/upload`, { method: 'POST', body }) },
   uploadKnowledgeDocuments: (id: string, files: File[]) => { const body = new FormData(); files.forEach((file) => body.append('files', file)); return request<BatchIngestionResult>(`/knowledge-bases/${encodeURIComponent(id)}/documents/batch-upload`, { method: 'POST', body }) },
@@ -113,16 +205,19 @@ export const studioApi = {
   rebuildKnowledgeBase: (id: string) => request<RebuildIndexResult>(`/knowledge-bases/${encodeURIComponent(id)}/rebuild-index`, { method: 'POST' }),
   deleteKnowledgeBase: (id: string) => request<void>(`/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   updateKnowledgeBase: (id: string, payload: { name: string; description?: string }) => request<KnowledgeBase>(`/knowledge-bases/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
-  clearKnowledgeDocuments: (id: string) => request<RebuildIndexResult>(`/knowledge-bases/${encodeURIComponent(id)}/clear-documents`, { method: 'POST' }),
+  clearKnowledgeDocuments: (id: string) => request<KnowledgeStats>(`/knowledge-bases/${encodeURIComponent(id)}/clear-documents`, { method: 'POST' }),
   listNodes: () => request<NodeConnection[]>('/nodes'),
   createNodeRegistrationToken: (payload?: { ttlSeconds?: number }) => request<NodeRegistrationToken>('/node-registration-tokens', { method: 'POST', body: JSON.stringify(payload ?? {}) }),
   getNode: (id: string) => request<NodeDetail>(`/nodes/${encodeURIComponent(id)}`),
   updateNode: (id: string, payload: { name?: string; enabled?: boolean }) => request<NodeConnection>(`/nodes/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteNode: (id: string) => request<void>(`/nodes/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   rotateNodeCredentials: (id: string) => request<RotateNodeSecretResult>(`/nodes/${encodeURIComponent(id)}/credentials/rotate`, { method: 'POST' }),
+  setNodeSystemAccess: (nodeId: string, enabled: boolean) => request<void>(`/nodes/${encodeURIComponent(nodeId)}/system-access`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   updateNodeTool: (nodeId: string, toolName: string, payload: { enabled?: boolean; requiresApproval?: boolean }) => request<NodeTool>(`/nodes/${encodeURIComponent(nodeId)}/tools/${encodeURIComponent(toolName)}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   listNodeToolApprovals: () => request<NodeToolApproval[]>('/node-tool-approvals'),
+  listToolApprovals: () => request<ToolApproval[]>('/tool-approvals'),
   decideNodeToolApproval: (id: string, approved: boolean) => request(`/node-tool-approvals/${encodeURIComponent(id)}/decision`, { method: 'POST', body: JSON.stringify({ approved }) }),
+  decideToolApproval: (id: string, approved: boolean) => request(`/tool-approvals/${encodeURIComponent(id)}/decision`, { method: 'POST', body: JSON.stringify({ approved }) }),
   setModelEnabled: (id: string, enabled: boolean) => request<ModelProfile>(`/models/${encodeURIComponent(id)}/status`, { method: 'PATCH', body: JSON.stringify({ enabled }) }),
   setDefaultModel: (modelProfileId: string) => request<{ defaultModelProfileId: string }>('/models/settings/default', { method: 'PATCH', body: JSON.stringify({ modelProfileId }) }),
   getConversation: (id: string) => request<Conversation>(`/conversations/${id}`),
@@ -138,7 +233,7 @@ export const studioApi = {
   listConversationAttachments: (conversationId: string) => request<ConversationAttachment[]>(`/conversations/${encodeURIComponent(conversationId)}/attachments`),
   downloadConversationAttachment: (conversationId: string, attachmentId: string) => requestBlob(`/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}/download`),
   deleteConversationAttachment: (conversationId: string, attachmentId: string) => request<void>(`/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`, { method: 'DELETE' }),
-  createRun: (payload: {
+  createRun: async (payload: {
     conversationId: string
     text: string
     agentId?: string
@@ -149,14 +244,33 @@ export const studioApi = {
     toolNames?: string[]
     nodeId?: string
     attachmentIds?: string[]
-  }) => request<CreateRunResponse>('/runs', {
-    method: 'POST',
-    body: JSON.stringify(payload),
-  }),
+    clientRequestId?: string
+    approvalMode?: ApprovalMode
+  }, options?: { idempotencyKey?: string; timeoutMs?: number }) => {
+    const clientRequestId = payload.clientRequestId ?? createUuid()
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), options?.timeoutMs ?? 20_000)
+    return request<CreateRunResponse>('/runs', {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, clientRequestId }),
+      signal: controller.signal,
+      timeoutMs: options?.timeoutMs ?? 20_000,
+      headers: {
+        'Idempotency-Key': options?.idempotencyKey ?? clientRequestId,
+        'X-Client-Request-Id': clientRequestId,
+      },
+    }).catch((error) => {
+      if (controller.signal.aborted) throw new RunLaunchTimeoutError(clientRequestId)
+      throw error
+    }).finally(() => window.clearTimeout(timeout))
+  },
   cancelRun: (id: string) => request<void>(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   retryRun: (id: string) => request<CreateRunResponse>(`/runs/${encodeURIComponent(id)}/retry`, { method: 'POST' }),
   getRun: (id: string) => request<RunView>(`/runs/${encodeURIComponent(id)}`),
+  findRunByClientRequestId: (clientRequestId: string) => request<RunView | null>(`/runs?clientRequestId=${encodeURIComponent(clientRequestId)}`),
+  listConversationRuns: (id: string) => request<RunView[]>(`/conversations/${encodeURIComponent(id)}/runs`),
   getRunAudit: (id: string) => request<RunAudit>(`/runs/${encodeURIComponent(id)}/audit`),
+  getRunWorkflow: (id: string) => request<RunWorkflow>(`/runs/${encodeURIComponent(id)}/workflow`),
   getConversationQueue: (id: string) => request<ConversationQueue>(`/conversations/${encodeURIComponent(id)}/queue`),
   listRunArtifacts: (id: string) => request<Artifact[]>(`/runs/${encodeURIComponent(id)}/artifacts`),
   downloadArtifact: (id: string) => requestBlob(`/artifacts/${encodeURIComponent(id)}`),
@@ -168,10 +282,14 @@ export async function streamRunEvents(
   runId: string,
   onEvent: (event: RunEvent) => void,
   signal?: AbortSignal,
+  options?: { onStatus?: (status: 'live' | 'reconnecting' | 'recovered' | 'lost') => void; heartbeatMs?: number },
 ) {
   let lastEventId = ''
+  let lastSequence = 0
   let retryCount = 0
   let terminal = false
+  const seenSequences = new Set<number>()
+  const heartbeatMs = options?.heartbeatMs ?? 35_000
 
   while (!terminal) {
     if (signal?.aborted) throw new DOMException('The run stream was aborted.', 'AbortError')
@@ -180,6 +298,7 @@ export async function streamRunEvents(
       response = await fetch(`${API_ROOT}/runs/${encodeURIComponent(runId)}/events`, {
         headers: {
           Accept: 'text/event-stream',
+          'Cache-Control': 'no-cache',
           ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {}),
           'X-Tenant-Id': localStorage.getItem('studio-tenant') ?? 'local',
           'X-User-Id': localStorage.getItem('studio-user') ?? 'local-user',
@@ -189,12 +308,14 @@ export async function streamRunEvents(
       })
     } catch (error) {
       if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+      options?.onStatus?.('reconnecting')
       if (retryCount >= 3) throw new Error('The run stream disconnected after three retries.')
       await waitForRetry(retryCount++, signal)
       continue
     }
 
-    if (!response.ok || !response.body) throw new Error(`Unable to connect to run stream (${response.status})`)
+    if (!response.ok) throw await apiErrorFromResponse(response, `Unable to connect to run stream (${response.status})`)
+    if (!response.body) throw new Error(`Unable to connect to run stream (${response.status})`)
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
@@ -205,7 +326,15 @@ export async function streamRunEvents(
         if (!event.data) return
         try {
           const parsed = JSON.parse(event.data) as RunEvent
+          if (Number.isFinite(parsed.sequence)) {
+            if (seenSequences.has(parsed.sequence) || parsed.sequence <= lastSequence) return
+            seenSequences.add(parsed.sequence)
+            lastSequence = Math.max(lastSequence, parsed.sequence)
+          }
           onEvent(parsed)
+          // A received event proves this connection is healthy; retries are consecutive.
+          retryCount = 0
+          options?.onStatus?.('live')
           if (['FINAL_ANSWER', 'RUN_FAILED', 'RUN_CANCELLED', 'RUN_INTERRUPTED'].includes(parsed.type)) terminal = true
         } catch {
           // Ignore keep-alive frames and malformed non-domain frames.
@@ -213,15 +342,56 @@ export async function streamRunEvents(
       },
     })
 
-    while (!ended) {
-      const chunk = await reader.read()
-      ended = chunk.done
-      if (chunk.value) parser.feed(decoder.decode(chunk.value, { stream: !ended }))
+    try {
+      while (!ended) {
+        const chunk = await readSseChunk(reader, heartbeatMs)
+        ended = chunk.done
+        if (chunk.value) {
+          parser.feed(decoder.decode(chunk.value, { stream: !ended }))
+          // The server may keep an SSE connection open for heartbeats after it
+          // has emitted a terminal run event. Stop reading immediately so the
+          // caller can finish the run and clear cancellation UI state without
+          // waiting for the server-side connection timeout.
+          if (terminal) {
+            await reader.cancel().catch(() => undefined)
+            ended = true
+          }
+        }
+      }
+    } catch (error) {
+      await reader.cancel().catch(() => undefined)
+      if (signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+      options?.onStatus?.('reconnecting')
+      if (retryCount >= 3) {
+        options?.onStatus?.('lost')
+        throw error
+      }
+      await waitForRetry(retryCount++, signal)
+      continue
     }
+    // Flush a final multibyte character or a complete event delivered with the last chunk.
+    const trailing = decoder.decode()
+    if (trailing) parser.feed(trailing)
     if (!terminal) {
+      options?.onStatus?.('reconnecting')
       if (retryCount >= 3) throw new Error('The run stream ended before a final answer was received.')
       await waitForRetry(retryCount++, signal)
     }
+  }
+  options?.onStatus?.('recovered')
+}
+
+async function readSseChunk(reader: ReadableStreamDefaultReader<Uint8Array>, heartbeatMs: number) {
+  let timer: number | undefined
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new RunStreamTimeoutError()), heartbeatMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer)
   }
 }
 

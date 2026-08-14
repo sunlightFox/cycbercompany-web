@@ -2,16 +2,18 @@ import { ArrowLeft, Check, CircleAlert, Copy, HardDrive, LoaderCircle, Pencil, P
 import { Children, type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { studioApi } from "../lib/api";
-import type { NodeConnection, NodeRegistrationToken, NodeTool, NodeToolApproval, RotateNodeSecretResult } from "../types";
+import type { NodeConnection, NodeDetail, NodeRegistrationToken, NodeTool, NodeToolApproval, RotateNodeSecretResult } from "../types";
 export default function NodeManager({
   nodes,
   nodesQuery,
   approvalsQuery,
+  managedLocalExecutorAvailable,
   t,
 }: {
   nodes: NodeConnection[];
   nodesQuery: ResourceQuery;
   approvalsQuery: ResourceQuery & { data?: NodeToolApproval[] };
+  managedLocalExecutorAvailable: boolean;
   t: (key: string) => string;
 }) {
   const queryClient = useQueryClient();
@@ -28,10 +30,16 @@ export default function NodeManager({
   const [rotatedCredentials, setRotatedCredentials] =
     useState<RotateNodeSecretResult | null>(null);
   const [copiedCredential, setCopiedCredential] = useState(false);
+  const managedLocalExecutor = nodes.find((node) => node.kind === "MANAGED_LOCAL");
   const detailsQuery = useQuery({
     queryKey: ["node", selectedId],
     queryFn: () => studioApi.getNode(selectedId!),
     enabled: Boolean(selectedId),
+  });
+  const localExecutorQuery = useQuery({
+    queryKey: ["managed-local-executor", managedLocalExecutor?.id],
+    queryFn: () => studioApi.getNode(managedLocalExecutor!.id),
+    enabled: Boolean(managedLocalExecutor),
   });
   const registerNode = useMutation({
     mutationFn: () => studioApi.createNodeRegistrationToken(),
@@ -63,8 +71,20 @@ export default function NodeManager({
       toolName: string;
       payload: { enabled?: boolean; requiresApproval?: boolean };
     }) => studioApi.updateNodeTool(nodeId, toolName, payload),
-    onSuccess: (_, variables) =>
-      queryClient.invalidateQueries({ queryKey: ["node", variables.nodeId] }),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["node", variables.nodeId] });
+      queryClient.invalidateQueries({
+        queryKey: ["managed-local-executor", variables.nodeId],
+      });
+    },
+  });
+  const updateSystemAccess = useMutation({
+    mutationFn: ({ nodeId, enabled }: { nodeId: string; enabled: boolean }) =>
+      studioApi.setNodeSystemAccess(nodeId, enabled),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["nodes"] });
+      queryClient.invalidateQueries({ queryKey: ["node", variables.nodeId] });
+    },
   });
   const removeNode = useMutation({
     mutationFn: studioApi.deleteNode,
@@ -100,12 +120,11 @@ export default function NodeManager({
   const systemTools = nodeTools.filter((tool) => tool.name.startsWith("system."));
   const systemAccessAvailable = (detailsQuery.data?.node.features ?? selectedNode?.features ?? [])
     .includes("system-access.v1");
-  const systemAccessEnabled = systemTools.length > 0 && systemTools.every((tool) => tool.enabled);
+  const systemAccessEnabled = systemTools.length > 0
+    && systemTools.every((tool) => tool.enabled && !tool.requiresApproval);
   const setSystemAccess = (enabled: boolean) => {
     if (!selectedNode || !systemAccessAvailable || !systemTools.length) return;
-    Promise.all(systemTools.map((tool) =>
-      studioApi.updateNodeTool(selectedNode.id, tool.name, { enabled, requiresApproval: true }),
-    )).then(() => queryClient.invalidateQueries({ queryKey: ["node", selectedNode.id] }));
+    updateSystemAccess.mutate({ nodeId: selectedNode.id, enabled });
   };
   const copyCommand = async () => {
     if (!registration) return;
@@ -349,7 +368,7 @@ export default function NodeManager({
           </div>
           <ToggleButton
             checked={systemAccessEnabled}
-            disabled={!systemAccessAvailable || !systemTools.length || updateTool.isPending}
+            disabled={!systemAccessAvailable || !systemTools.length || updateTool.isPending || updateSystemAccess.isPending}
             onChange={setSystemAccess}
             label={t("hostAccess")}
           />
@@ -437,6 +456,22 @@ export default function NodeManager({
       </div>
       {section === "nodes" ? (
         <>
+          <ManagedLocalExecutorStatus
+            node={managedLocalExecutor}
+            details={localExecutorQuery.data}
+            toolsLoading={localExecutorQuery.isLoading}
+            updatingTools={updateTool.isPending}
+            available={managedLocalExecutorAvailable}
+            onUpdateTool={(toolName, payload) => {
+              if (!managedLocalExecutor) return;
+              updateTool.mutate({
+                nodeId: managedLocalExecutor.id,
+                toolName,
+                payload,
+              });
+            }}
+            t={t}
+          />
           <div className="node-onboarding">
             <div>
               <strong>{t("nodeConnectTitle")}</strong>
@@ -532,6 +567,159 @@ export default function NodeManager({
           )}
         </QueryResourceState>
       )}
+    </div>
+  );
+}
+
+function ManagedLocalExecutorStatus({
+  node,
+  details,
+  toolsLoading,
+  updatingTools,
+  available,
+  onUpdateTool,
+  t,
+}: {
+  node?: NodeConnection;
+  details?: NodeDetail;
+  toolsLoading: boolean;
+  updatingTools: boolean;
+  available: boolean;
+  onUpdateTool: (toolName: string, payload: {
+    enabled?: boolean;
+    requiresApproval?: boolean;
+  }) => void;
+  t: (key: string) => string;
+}) {
+  const [workspace, setWorkspace] = useState("");
+  const [copied, setCopied] = useState(false);
+  const online = Boolean(available && node?.enabled && node.status?.toUpperCase() === "ONLINE");
+  const status = !available
+    ? t("localExecutorUnavailable")
+    : !node
+    ? t("localExecutorUnprovisioned")
+    : !node.enabled
+      ? t("disabled")
+      : statusLabel(node.status, t);
+  const command = localExecutorStartCommand(workspace);
+  const workspaceConfigured = Boolean(workspace.trim());
+  const systemTools = (details?.tools ?? []).filter((tool) =>
+    tool.name.startsWith("system."),
+  );
+  const copyCommand = async () => {
+    try {
+      await navigator.clipboard?.writeText(command);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+
+  return (
+    <section className="managed-local-executor" aria-label={t("localExecutor")}>
+      <span className="managed-local-executor-icon" aria-hidden="true">
+        <HardDrive size={16} />
+      </span>
+      <div className="managed-local-executor-copy">
+        <div className="managed-local-executor-heading">
+          <div>
+            <strong>{t("localExecutor")}</strong>
+            <p>{!available ? t("localExecutorUnavailableHint") : node ? t("localExecutorConnectedHint") : t("localExecutorHint")}</p>
+          </div>
+          <span className="list-status">
+            <span className="status-dot" data-online={online} />
+            {status}
+          </span>
+        </div>
+        <div className="managed-local-executor-meta">
+          <LocalExecutorMeta label={t("lastSeen")} value={node ? formatTimestamp(node.lastSeenAt) : "-"} />
+          <LocalExecutorMeta label={t("nodeVersion")} value={node?.clientVersion || "-"} />
+          <LocalExecutorMeta label={t("nodeArchitecture")} value={[node?.osName, node?.osArch].filter(Boolean).join(" · ") || "-"} />
+          <LocalExecutorMeta
+            label={t("localExecutorTools")}
+            value={toolsLoading ? t("loading") : details ? String(details.tools.length) : "-"}
+          />
+        </div>
+        {online && systemTools.length ? (
+          <>
+            <div className="knowledge-documents-heading">
+              <div>
+                <strong>{t("localExecutorCapabilities")}</strong>
+                <span>{systemTools.length}</span>
+              </div>
+            </div>
+            <div className="node-tool-list">
+              {systemTools.map((tool) => (
+                <NodeToolPolicyRow
+                  key={tool.id}
+                  tool={tool}
+                  busy={updatingTools}
+                  onChange={(payload) => onUpdateTool(tool.name, payload)}
+                  t={t}
+                />
+              ))}
+            </div>
+          </>
+        ) : null}
+        {!online && available ? (
+          <div className="local-executor-launch">
+            <div>
+              <strong>{t("localExecutorStartTitle")}</strong>
+              <p>{t("localExecutorStartHint")}</p>
+            </div>
+            <label>
+              {t("localExecutorWorkspace")}
+              <input
+                value={workspace}
+                onChange={(event) => {
+                  setWorkspace(event.target.value);
+                  setCopied(false);
+                }}
+                placeholder={t("localExecutorWorkspacePlaceholder")}
+              />
+            </label>
+            {workspaceConfigured ? (
+              <div className="node-command local-executor-command">
+                <code>{command}</code>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void copyCommand()}
+                >
+                  <Copy size={14} />
+                  {copied ? t("commandCopied") : t("localExecutorCopyStartCommand")}
+                </button>
+              </div>
+            ) : (
+              <p className="local-executor-workspace-hint">{t("localExecutorWorkspaceHint")}</p>
+            )}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function localExecutorStartCommand(workspace: string) {
+  const configuredServer = import.meta.env.VITE_NODE_SERVER_URL;
+  const configuredApiRoot = import.meta.env.VITE_API_BASE_URL;
+  const server = typeof configuredServer === "string" && /^https?:\/\//i.test(configuredServer)
+    ? configuredServer.replace(/\/+$/, "")
+    : typeof configuredApiRoot === "string" && /^https?:\/\//i.test(configuredApiRoot)
+    ? new URL(configuredApiRoot).origin
+    : window.location.origin;
+  const workspaceArgument = workspace.trim()
+    ? ` --workspace "${workspace.trim().replaceAll('"', '\\"')}"`
+    : "";
+  const argumentsValue = `start-local --server ${server}${workspaceArgument}`.replaceAll("'", "''");
+  return `.\\gradlew.bat :agent-studio-node-java:run '--args=${argumentsValue}'`;
+}
+
+function LocalExecutorMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
     </div>
   );
 }

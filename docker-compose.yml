@@ -6,6 +6,7 @@ services:
     container_name: spring-agent-studio-web
     ports:
       - "5173:5173"
+      - "5174:5173"
       # The backend shares this network namespace. Expose it only to the host
       # so the local node client can use the same API as the browser.
       - "127.0.0.1:8083:8080"
@@ -35,7 +36,9 @@ services:
       SERVER_ADDRESS: 127.0.0.1
       PORT: 8080
       APP_SECURITY_MODE: LOCAL
-      APP_DATA_DIR: /workspace/data
+      # Keep the container's development state isolated from a host-side backend.
+      # H2 file databases are single-writer; sharing /workspace/data can corrupt it.
+      APP_DATA_DIR: /workspace/.runtime-data
       SEARXNG_ENDPOINT: http://searxng:8080
       EDGEFN_API_KEY: ${EDGEFN_API_KEY:-}
       GRADLE_USER_HOME: /home/gradle/.gradle

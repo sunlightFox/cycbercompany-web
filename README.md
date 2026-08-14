@@ -41,7 +41,7 @@ $env:EDGEFN_API_KEY = 'sk-...'
 docker compose up -d --build
 ```
 
-The development server proxies `/api` to `http://localhost:8080`. Set `VITE_DEV_PROXY_TARGET` for another local backend port. Set `VITE_API_BASE_URL` to the deployed backend API root when the frontend and backend are hosted on different origins.
+The development server proxies `/api` to `http://localhost:8080`. Set `VITE_DEV_PROXY_TARGET` for another local backend port. Set `VITE_API_BASE_URL` to the deployed backend API root when the frontend and backend are hosted on different origins. Set `VITE_NODE_SERVER_URL` when the managed local executor should connect directly to a loopback backend rather than through the frontend origin, for example `http://127.0.0.1:8000` for the Python backend.
 
 ## Product rules
 

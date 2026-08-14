@@ -17,6 +17,7 @@ import type {
   CodingRunEvidence,
   CodingRunQuality,
   RunAudit,
+  RunWorkflow,
 } from "../types";
 
 type Translator = (key: string) => string;
@@ -25,6 +26,7 @@ export default function RunAuditDrawer({
   evidence,
   quality,
   audit,
+  workflow,
   artifacts,
   loading,
   error,
@@ -35,6 +37,7 @@ export default function RunAuditDrawer({
   evidence?: CodingRunEvidence;
   quality?: CodingRunQuality;
   audit?: RunAudit;
+  workflow?: RunWorkflow;
   artifacts?: Artifact[];
   loading: boolean;
   error: boolean;
@@ -104,6 +107,31 @@ export default function RunAuditDrawer({
                   <span>{t("auditTimeline")}</span>
                   <strong>{audit?.timeline.length ?? 0}</strong>
                 </div>
+                {workflow ? (
+                  <section className="audit-section">
+                    <h3>{t("workflowStatus")}</h3>
+                    <dl className="audit-snapshot">
+                      <div>
+                        <dt>{t("workflowPhase")}</dt>
+                        <dd>{workflow.phase}</dd>
+                      </div>
+                      <div>
+                        <dt>{t("workflowGoal")}</dt>
+                        <dd>{workflow.goal || "-"}</dd>
+                      </div>
+                      <div>
+                        <dt>{t("workflowTools")}</dt>
+                        <dd>{workflow.completedToolCalls} / {workflow.failedToolCalls}</dd>
+                      </div>
+                      <div>
+                        <dt>{t("workflowLastTool")}</dt>
+                        <dd>{workflow.lastToolName ?? "-"}</dd>
+                      </div>
+                    </dl>
+                    <WorkflowPlan planJson={workflow.planJson} t={t} />
+                    {workflow.lastError ? <p className="audit-error">{workflow.lastError}</p> : null}
+                  </section>
+                ) : null}
                 {audit?.snapshot ? (
                   <section className="audit-section">
                     <h3>{t("auditSnapshot")}</h3>
@@ -226,6 +254,35 @@ export default function RunAuditDrawer({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+  );
+}
+
+function WorkflowPlan({ planJson, t }: { planJson: string; t: Translator }) {
+  let steps: Array<{ step?: string; status?: string }> = [];
+  try {
+    const parsed: unknown = JSON.parse(planJson);
+    if (Array.isArray(parsed)) {
+      steps = parsed.filter(
+        (item): item is { step?: string; status?: string } => Boolean(item && typeof item === "object"),
+      );
+    }
+  } catch {
+    steps = [];
+  }
+  const visibleSteps = steps.filter((item) => item.step);
+  if (!visibleSteps.length) return null;
+  return (
+    <div className="workflow-plan">
+      <strong>{t("workflowPlan")}</strong>
+      <ol>
+        {visibleSteps.map((item) => (
+          <li key={item.step} className={`is-${item.status ?? "pending"}`}>
+            <span>{item.step}</span>
+            <small>{item.status ?? "pending"}</small>
+          </li>
+        ))}
+      </ol>
+    </div>
   );
 }
 
