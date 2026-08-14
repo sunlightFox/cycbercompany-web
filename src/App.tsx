@@ -59,7 +59,7 @@ import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
-import { RunLaunchTimeoutError, studioApi, streamRunEvents } from "./lib/api";
+import { RunLaunchTimeoutError, StudioApiError, studioApi, streamRunEvents } from "./lib/api";
 import { createUuid } from "./lib/uuid";
 import { useStudioStore } from "./store/useStudioStore";
 import { AgentManager } from "./components/AgentManager";
@@ -946,6 +946,20 @@ function App() {
     [t],
   );
 
+  const discardMissingConversation = useCallback((id: string) => {
+    setHistoryEntries((current) => {
+      const next = current.filter((entry) => entry.id !== id);
+      writeHistory(next);
+      return next;
+    });
+    setRecoveryRunIds([]);
+    setManagedRunIds([]);
+    setStoppingRunIds([]);
+    setConversationId(null);
+    setMessages([]);
+    setComposerNotice(null);
+  }, [setConversationId, setMessages]);
+
   const resetTask = useCallback(() => {
     conversationLoadRef.current += 1;
     setConversationId(null);
@@ -1425,6 +1439,14 @@ function App() {
         setComposerNotice(null);
         window.setTimeout(() => textareaRef.current?.focus(), 0);
       } catch (error) {
+        if (
+          error instanceof StudioApiError &&
+          (error.status === 404 ||
+            (error.status === 400 && error.message.startsWith("Conversation not found:")))
+        ) {
+          discardMissingConversation(id);
+          return;
+        }
         setComposerNotice(
           error instanceof Error ? error.message : t("loadFailed"),
         );
@@ -1432,7 +1454,7 @@ function App() {
         setOpeningConversationId(null);
       }
     },
-    [openingConversationId, setConversationId, setMessages, t, trackRun],
+    [discardMissingConversation, openingConversationId, setConversationId, setMessages, t, trackRun],
   );
 
   useEffect(() => {
