@@ -1,48 +1,102 @@
-# Spring Agent Studio Web
+# CycberCompany Web
 
-The conversation-first frontend for Spring Agent Studio. It connects to the local Spring Boot backend, keeps execution steps inline with assistant messages, and progressively reveals citations and configuration.
+[中文](README.zh-CN.md) | [English](README.md)
 
-## Run
+CycberCompany Web is the conversation-first workspace for CycberCompany. It combines durable conversations, streamed execution progress, citations, and on-demand management for agents, Skills, MCP connections, knowledge bases, models, and local execution capabilities.
+
+## Links
+
+- [Backend repository](https://github.com/sunlightFox/spring-agent-studio-backend)
+- [Technical documentation](https://cycbercompany.chat/docs)
+
+## Highlights
+
+- **Conversation-first workspace** — Keep the task, assistant response, and execution progress in one readable message flow.
+- **Live run updates** — Receive backend Run events through SSE, including progress, approval, completion, cancellation, and error states.
+- **Progressive disclosure** — Show execution details and citations only when useful; keep management functions out of the default workspace.
+- **Agent operations** — Configure agents, Skills, MCP connections, knowledge bases, models, and execution nodes from a dedicated management workspace.
+- **Bilingual interface** — Support instant Simplified Chinese and English switching, with the preference persisted locally.
+- **Accessible and responsive** — Support keyboard operation, light and dark themes, and desktop, tablet, and mobile layouts.
+
+## Technology
+
+| Area | Choice |
+| --- | --- |
+| Framework | React 19, TypeScript, Vite |
+| Server state | TanStack Query |
+| Forms | React Hook Form, Zod |
+| UI primitives | Radix UI, Lucide icons |
+| Markdown | react-markdown, remark-gfm |
+| Streaming | EventSource parser |
+| Internationalization | i18next, react-i18next |
+
+## Prerequisites
+
+- Node.js 20 or newer
+- npm
+- A running CycberCompany backend (the development default is `http://localhost:8080`)
+
+## Quick start
 
 ```powershell
 npm install
 npm run dev
 ```
 
+Open [http://localhost:5173](http://localhost:5173). In development, Vite proxies `/api` requests to `http://localhost:8080` by default.
+
+Build a production bundle and run static checks:
+
+```powershell
+npm run build
+npm run lint
+```
+
+Preview the production build locally:
+
+```powershell
+npm run preview
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` when you need local overrides. Do not commit `.env` files.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `VITE_API_BASE_URL` | `/api/v1` | Browser-facing API root. Use the deployed backend API root when frontend and backend use different origins. |
+| `VITE_DEV_PROXY_TARGET` | `http://localhost:8080` | Backend target for the Vite development proxy. |
+| `VITE_NODE_SERVER_URL` | empty | Direct loopback backend address for the local executor launch command. |
+
 ## Run with Docker
 
-Start the frontend, Spring Boot backend, and SearXNG search service from the
-frontend project root:
-
-```powershell
-docker compose up -d --build
-```
-
-Open `http://localhost:5173` after the backend becomes healthy. The frontend and
-backend source directories are mounted into their respective containers, so code
-changes are picked up without rebuilding. Node and Gradle dependencies are kept
-in Docker volumes rather than written to the host.
-
-On subsequent starts, only start the existing service:
-
-```powershell
-docker compose start
-```
-
-Stop it with `docker compose stop`. To rebuild dependencies after changing
-`package-lock.json`, run `docker compose up -d --build`.
-
-The frontend proxies `/api` to a loopback-only backend in the same Docker
-network namespace, and the backend uses the `searxng` service internally. Supply the model key through the shell before
-starting the stack:
+From the frontend repository root, start the frontend, Spring Boot backend, and SearXNG search service together:
 
 ```powershell
 $env:EDGEFN_API_KEY = 'sk-...'
 docker compose up -d --build
 ```
 
-The development server proxies `/api` to `http://localhost:8080`. Set `VITE_DEV_PROXY_TARGET` for another local backend port. Set `VITE_API_BASE_URL` to the deployed backend API root when the frontend and backend are hosted on different origins. Set `VITE_NODE_SERVER_URL` when the managed local executor should connect directly to a loopback backend rather than through the frontend origin, for example `http://127.0.0.1:8000` for the Python backend.
+Then open [http://localhost:5173](http://localhost:5173). The backend is published only to the host loopback interface on port `8083`; the frontend connects through its same-network proxy, while the backend uses SearXNG internally.
 
-## Product rules
+```powershell
+docker compose start
+docker compose stop
+```
 
-Read [docs/frontend-ui-spec.md](docs/frontend-ui-spec.md) before changing the interface. The rules are intentionally strict: the default surface is a quiet conversation workspace, while execution details, sources, and management controls appear only when needed.
+Source folders are mounted into the containers for development. Node modules, Gradle caches, and backend build output stay in Docker volumes rather than being written to the host workspace.
+
+## Project structure
+
+```text
+src/
+├── components/   Reusable workspace and management UI
+├── lib/          API client, i18n, streaming, and utility code
+├── App.tsx       Application composition and user flows
+├── App.css       Semantic visual tokens and responsive styles
+└── types.ts      Frontend domain types
+```
+
+## Product conventions
+
+Read [the frontend UI specification](docs/frontend-ui-spec.md) before changing the interface. It defines mandatory conventions for the conversation-first layout, progressive disclosure, themes, bilingual support, responsiveness, and accessibility.
